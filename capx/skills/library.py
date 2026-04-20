@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from capx.envs.simulators._paths import resolve_relative_to_capx
 from capx.skills.extractor import extract_functions
 
 
@@ -33,7 +34,9 @@ class SkillLibrary:
     and promoted to the active library when they appear in multiple tasks.
     """
 
-    DEFAULT_PATH = Path(".capx_skills.json")
+    # Anchor at the cap-x repo root so the library file is stable across
+    # subprocesses that run with a different working directory.
+    DEFAULT_PATH = Path(resolve_relative_to_capx(".capx_skills.json"))
 
     def __init__(self, path: Path | str | None = None):
         self.path = Path(path) if path else self.DEFAULT_PATH
