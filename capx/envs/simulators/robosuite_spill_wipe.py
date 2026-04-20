@@ -16,6 +16,7 @@ from robosuite.controllers.composite.composite_controller_factory import (
     load_composite_controller_config,
 )
 
+from capx.envs.simulators._paths import resolve_relative_to_capx
 from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
 
 
@@ -35,7 +36,7 @@ class FrankaRobosuiteSpillWipeLowLevel(RobosuiteBaseEnv):
         enable_render: bool = False,
     ) -> None:
         super().__init__(
-            controller_cfg=controller_cfg,
+            controller_cfg=resolve_relative_to_capx(controller_cfg),
             max_steps=max_steps,
             seed=seed,
             viser_debug=False,

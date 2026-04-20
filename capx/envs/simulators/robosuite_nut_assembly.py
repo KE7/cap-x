@@ -21,6 +21,7 @@ from robosuite.utils.camera_utils import get_real_depth_map
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
+from capx.envs.simulators._paths import resolve_relative_to_capx
 from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
 from capx.utils.camera_utils import obs_get_rgb
 from capx.utils.depth_utils import depth_color_to_pointcloud
@@ -43,7 +44,7 @@ class FrankaRobosuiteNutAssembly(RobosuiteBaseEnv):
         enable_render: bool = False,
     ) -> None:
         super().__init__(
-            controller_cfg=controller_cfg,
+            controller_cfg=resolve_relative_to_capx(controller_cfg),
             max_steps=max_steps,
             seed=seed,
             viser_debug=False,
