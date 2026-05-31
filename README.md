@@ -35,6 +35,8 @@ Shankar Sastry<sup>2</sup>, Yuke Zhu<sup>1</sup>, Ken Goldberg<sup>&dagger;,2</s
 
 CaP-X uses [uv](https://docs.astral.sh/uv/) for dependency management. Requires **Python 3.10** and a **CUDA-capable GPU**.
 
+> **On aarch64 / NVIDIA DGX Spark (GB10, CUDA 13)?** The instructions below are for x86_64. Follow [docs/spark-aarch64-setup.md](docs/spark-aarch64-setup.md) instead — it has the cu130 torch recipe, per-venv setup scripts, and the curobo/open3d/decord workarounds for ARM.
+
 ```bash
 git clone --recurse-submodules https://github.com/capgym/cap-x && cd cap-x
 
