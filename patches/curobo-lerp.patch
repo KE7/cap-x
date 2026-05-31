@@ -1,0 +1,34 @@
+# curobo lerp / C++20 std::lerp collision fix for CUDA 13 (DGX Spark / GB10, sm_121).
+#
+# Apply from inside the curobo submodule before building it on CUDA 13:
+#   git -C capx/third_party/curobo apply ../../../patches/curobo-lerp.patch
+# or:
+#   ( cd capx/third_party/curobo && patch -p1 < ../../../patches/curobo-lerp.patch )
+#
+# WHY: under -std=c++20 (CUDA 13 default for these TUs) the C++20 constexpr
+# std::lerp(float,float,float) collides with curobo's identical-signature scalar
+# overload when std:: is in scope, breaking the curobo CUDA-extension build.
+# This guards curobo's scalar overload out when std::lerp is available.
+# The vector overloads (float2/float3/float4) are untouched.
+#
+diff --git a/src/curobo/curobolib/cpp/helper_math.h b/src/curobo/curobolib/cpp/helper_math.h
+index f0140ae..96d2e8d 100644
+--- a/src/curobo/curobolib/cpp/helper_math.h
++++ b/src/curobo/curobolib/cpp/helper_math.h
+@@ -1127,10 +1127,16 @@ inline __host__ __device__ uint4 max(uint4 a, uint4 b)
+ // - linear interpolation between a and b, based on value t in [0, 1] range
+ ////////////////////////////////////////////////////////////////////////////////
+ 
++// C++20 (<cmath>) introduces constexpr std::lerp(float,float,float); when a
++// translation unit pulls it into global scope (`using namespace std;`) it
++// collides with this identical-signature overload. Skip our scalar overload
++// when std::lerp is available (it is constexpr and device-callable in CUDA 13+).
++#if !defined(__cpp_lib_interpolate)
+ inline __device__ __host__ float lerp(float a, float b, float t)
+ {
+     return a + t*(b-a);
+ }
++#endif
+ inline __device__ __host__ float2 lerp(float2 a, float2 b, float t)
+ {
+     return a + t*(b-a);
