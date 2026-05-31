@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+import os
+
+# The pyroki IK/plan server only needs capx.integrations.motion.pyroki_snippets,
+# not the heavy franka/libero API registry (robosuite/torch/open3d). Default the
+# isolation flag ON so this server imports cleanly in its dedicated GPU venv
+# (.venv-pyroki) which deliberately omits those deps. setdefault keeps any
+# explicit override from the environment. Must run before importing
+# capx.integrations.* below.
+os.environ.setdefault("CAPX_PYROKI_SERVER_ONLY", "1")
+
 import asyncio
 import functools
 import json

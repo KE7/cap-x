@@ -40,12 +40,28 @@ logging.basicConfig(
 logger = logging.getLogger("launch_servers")
 
 # ---------------------------------------------------------------------------
+# Per-server interpreter overrides
+# ---------------------------------------------------------------------------
+
+# Repo root (…/cap-x), used to locate isolated per-server venvs.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The pyroki IK/plan server runs GPU-enabled JAX (jax[cuda13], numpy 2.x) which
+# is incompatible with the benchmark venvs (numpy 1.26.4). It therefore lives in
+# its own dedicated venv and is reached over HTTP. Launch it with that venv's
+# interpreter instead of ``sys.executable``. Falls back to ``sys.executable`` if
+# the venv is absent (see :func:`_build_cmd`).
+_PYROKI_VENV_PYTHON = _REPO_ROOT / ".venv-pyroki" / "bin" / "python"
+
+# ---------------------------------------------------------------------------
 # Server Registry
 # ---------------------------------------------------------------------------
 
 # Maps a short server name to its launch module and resource requirements.
 # The "target" field corresponds to the ``_target_`` values found in YAML
 # configs (minus the trailing ``.main``).
+# An optional "python" field overrides the interpreter used to launch that
+# server (default: ``sys.executable`` — the launcher's own interpreter).
 SERVER_REGISTRY: dict[str, dict[str, Any]] = {
     "sam3": {
         "target": "capx.serving.launch_sam3_server",
@@ -63,10 +79,14 @@ SERVER_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "pyroki": {
         "target": "capx.serving.launch_pyroki_server",
+        # Now GPU-enabled (jax[cuda13]); must be marked gpu_required so the
+        # launcher exposes a GPU via CUDA_VISIBLE_DEVICES instead of blanking it.
         "default_port": 8116,
-        "gpu_required": False,
-        "gpu_memory_mb": 0,
+        "gpu_required": True,
+        "gpu_memory_mb": 2000,
         "extra_args": {},
+        # Dedicated GPU venv (jax[cuda13], numpy 2.x), isolated from benchmark venvs.
+        "python": str(_PYROKI_VENV_PYTHON),
     },
     "sam2": {
         "target": "capx.serving.launch_sam2_server",
@@ -306,8 +326,27 @@ def _build_cmd(server_config: dict[str, Any], workers: int) -> list[str]:
     port = server_config.get("port", reg["default_port"])
     host = server_config.get("host", "127.0.0.1")
 
+    # Per-server interpreter override (config wins over registry); defaults to
+    # the launcher's own interpreter. Falls back to sys.executable if a
+    # configured interpreter is missing so a misconfigured/absent venv never
+    # blocks startup.
+    interpreter = server_config.get("python") or reg.get("python") or sys.executable
+    if interpreter != sys.executable and not Path(interpreter).exists():
+        hint = ""
+        if name == "pyroki":
+            hint = " Create it with ./scripts/setup_pyroki_venv.sh"
+        logger.warning(
+            "Configured interpreter for %s not found at %s; falling back to %s. "
+            "The fallback interpreter may lack this server's dependencies.%s",
+            name,
+            interpreter,
+            sys.executable,
+            hint,
+        )
+        interpreter = sys.executable
+
     cmd = [
-        sys.executable,
+        interpreter,
         "-m",
         module,
         "--port",
