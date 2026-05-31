@@ -50,7 +50,7 @@ git submodule update --init --recursive
 | robosuite | `.venv` | Robosuite (1.5) benchmark | `./scripts/setup_robosuite_venv.sh` (§6) |
 | libero | `.venv-libero` | LIBERO-PRO (robosuite 1.4) + contact-graspnet | `./scripts/setup_libero_venv.sh` (§6) |
 | pyroki | `.venv-pyroki` | GPU JAX IK/plan HTTP server | `./scripts/setup_pyroki_venv.sh` (§7) † |
-| BEHAVIOR | `capx/third_party/b1k/.venv` | OmniGibson + Isaac Sim 5.1 | manual, see §9 (in progress) |
+| BEHAVIOR | `capx/third_party/b1k/.venv` | OmniGibson + Isaac Sim 5.1 | manual, see §9 (working) |
 
 robosuite (1.5) and LIBERO (robosuite 1.4) declare a conflict, so they need
 separate venvs. pyroki runs GPU JAX (numpy 2.x) which is incompatible with the
@@ -236,12 +236,20 @@ on py3.11.
 
 ---
 
-## 9. BEHAVIOR (OmniGibson + Isaac Sim 5.1) — IN PROGRESS
+## 9. BEHAVIOR (OmniGibson + Isaac Sim 5.1) — WORKING
 
-> ⚠️ **Status: partially working; one hard blocker (curobo on CUDA 12.8) is
-> still open at the time of writing — see §10.** The b1k submodule work lives on
-> branch `feat/omnigibson-3.8.0-isaac5.1` and is owned by a separate worker;
-> this section documents the wiring, it does not script it.
+> ✅ **Status: working on this GB10 box.** BEHAVIOR runs end-to-end with
+> **Isaac Sim 5.1 + OmniGibson 3.8.0 + bddl3 3.8** (b1k branch
+> `feat/omnigibson-3.8.0-isaac5.1`, commits `606dcfc40` OmniGibson + `86fae07ab`
+> bddl3). The cuRobo motion path that previously appeared blocked is **resolved**
+> — R1Pro warmup + plan PASS and a real `turning_on_radio` BEHAVIOR episode ran
+> end-to-end on the real GB10 (cap (12,1)), no crash. The fix is **three small
+> in-process patches** (below); there was **no CUDA-12.8-toolkit / out-of-process
+> / cuMotion requirement**. The b1k submodule work lives on branch
+> `feat/omnigibson-3.8.0-isaac5.1` and is owned by a separate worker; this
+> section documents the wiring, it does not script it. Remaining gaps are about a
+> *fully-scored agent eval* (perception servers, LLM backend), **not** the motion
+> fix — see §10.
 
 **Key facts established on this box:**
 - The only Isaac Sim with an aarch64 build is **5.1.0**, **source-built** per the
@@ -278,26 +286,82 @@ Verified under this env: `import isaacsim` (source build), `import omnigibson` =
 - Rewire the verify step to `source $ISAAC_PATH/setup_python_env.sh` + the
   `LD_PRELOAD` above; make it non-fatal.
 
-**Local CUDA 12.8 curobo build (the open blocker):** Isaac's bundled torch is
-`2.7.0+cu128`, and curobo must build against that exact torch, but the only
-system toolkit is CUDA 13.0. The fix in progress is a **local, non-permanent**
-CUDA 12.8 toolkit (does **not** touch `/usr/local/cuda`), with
-`CUDA_HOME=<local-12.8>`, `TORCH_CUDA_ARCH_LIST=12.1+PTX`, `--no-build-isolation`
-under the wired env. Until curobo builds, the full `picking_up_trash` motion-gen
-E2E is deferred (the modified holonomic-base helpers were verified directly on a
-live R1Pro; 34 unit tests pass).
+### The cuRobo "illegal memory access" — root-caused and fixed (NOT a CUDA-toolkit issue)
+
+The cuRobo `lbfgs_step_cu` *"illegal memory access"* crash that previously looked
+like a hard blocker was **fully root-caused on this GB10 and fixed in-process** —
+it was **never** a cu128-vs-cu130, CUDA-context, build-against-Isaac-torch, or
+local-toolkit problem. cuRobo runs **in-process fine** under Isaac's bundled
+`torch 2.7.0+cu128` (franka and R1Pro base+arm all plan successfully).
+
+**Root cause:** OmniGibson 3.8.0 already excludes the crash-prone R1Pro `default`
+cuRobo embodiment on Blackwell, but its guard in
+`OmniGibson/omnigibson/action_primitives/curobo.py` only matched GPU capability
+`(12,0)` (RTX 50-series). **GB10 is `(12,1)`**, so the guard missed and R1Pro kept
+its crashing `default` embodiment → illegal memory access in `lbfgs_step_cu`.
+
+**Fix — three small in-process patches on the b1k branch** (no CUDA 12.8 toolkit,
+no out-of-process server, no cuMotion):
+
+1. **Commit `93695c82e`** — widen the Blackwell guard from `== (12,0)` to
+   `get_device_capability(device)[0] == 12` so it covers GB10 `(12,1)` (and all
+   future sm_12x). This **excludes** R1Pro's `default` embodiment and keeps its
+   safe **base + arm** embodiments (and keeps Tiago's `default`). Applied at the
+   functional site in `action_primitives/curobo.py` plus the `tests/test_curobo.py`
+   and `tests/test_primitives.py` guards.
+2. **Commit `c5182e88f`** — two follow-on fixes that are real GB10 blockers the
+   cu128 runtime hits (the cu130-based RCA never did):
+   - **Obstacle-update DEFAULT fallback:** `update_obstacles()`/`remove_obstacles()`
+     hard-coded `self.mg[DEFAULT].update_world()`, which `KeyError`s once `default`
+     is excluded; the shared world-collision checker now updates via any present
+     embodiment.
+   - **cu128 NVRTC fuser disable:** under Isaac's cu128 torch on sm_121, the
+     TensorExpr JIT fuser emits an NVRTC kernel whose `-arch` cu128 rejects,
+     crashing at `import curobo.wrap.reacher.motion_gen`. Disabled the GPU JIT
+     fuser on Blackwell sm_12x (runtime flag only — no torch swap / toolkit change).
+
+> ⚠️ **Do NOT set `use_default_embodiment_only=True`.** This was an earlier
+> (wrong) idea — it does the *opposite* of the fix: it re-adds R1Pro's crashing
+> `default` embodiment and the illegal-memory-access returns. Leave it at its
+> default `False`.
+
+**Verified on the real GB10** (cap `(12,1)`, no faked capability, in-process under
+Isaac + GPU physics):
+- R1Pro `warmup()` + `compute_trajectories` plan → `WARMUP_OK`,
+  `PLAN_SUCCESS: True` (kept embodiments `['arm', 'base']`, `default` excluded).
+- A real **`turning_on_radio`** BEHAVIOR episode ran end-to-end: scene
+  `house_double_floor_lower` built, R1Pro loaded and stepped, R1Pro executed a
+  cuRobo-planned **31-waypoint** trajectory (the exact L-BFGS/IK path that used to
+  crash) — no illegal-memory crash.
+- Dataset in place: BEHAVIOR-1K assets (33 GB) + 2025 challenge task instances
+  (400 MB) downloaded to `capx/third_party/b1k/datasets`.
 
 ---
 
 ## 10. Known gaps / TODO
 
-1. **BEHAVIOR curobo (CUDA 12.8) unresolved.** Needs a local CUDA 12.8 toolkit to
-   match Isaac's cu128 torch; build in progress. Full motion-gen E2E blocked until
-   it lands.
+1. **BEHAVIOR curobo — RESOLVED (no longer a blocker).** Root-caused to the
+   OmniGibson Blackwell embodiment guard missing GB10 `(12,1)`; fixed in-process
+   on the b1k branch (commits `93695c82e` + `c5182e88f`, see §9). R1Pro
+   warmup+plan and a real `turning_on_radio` episode are verified end-to-end on the
+   real GB10 — **no CUDA 12.8 toolkit / out-of-process server needed**. The
+   remaining gaps below are for a *fully-scored agent eval*, **not** the motion fix:
+   - **Perception servers not yet in the b1k venv.** SAM3 + ContactGraspNet are
+     installed only in `.venv-libero`, not `capx/third_party/b1k/.venv`; the oracle
+     grasp/segmentation path needs them. Install without the curobo reinstall
+     (which would undo the fix) and without `decord` (no aarch64 wheel, §8).
+   - **aarch64 instance-segmentation render crash (separate bug).** An unrelated
+     `OgnInstanceSegmentation::compute` segfault in `omni.replicator.core` on
+     camera/`seg_instance` obs modalities (avoided by running proprio-only); a
+     full perception-driven trial on this box would need this addressed. Not curobo.
+   - **LLM backend for non-oracle configs.** Point the agent at the local Qwen
+     vLLM at `:8000` (`Qwen/Qwen3.6-27B-FP8`) or OpenRouter; oracle configs
+     (`use_oracle_code: true`) need no LLM key.
 2. **Machine-specific Isaac path** (`/home/batman/Documents/open-source/isaacsim/...`)
    is hard-coded to this box — parameterize via `ISAAC_PATH` and confirm per machine.
 3. **`uv_install.sh` edits uncommitted** on the b1k branch; committing them (and a
-   BEHAVIOR setup script) is pending the curobo fix + coordination with the b1k owner.
+   BEHAVIOR setup script) is pending coordination with the b1k owner. (The curobo
+   fix itself is done and committed — see §9 commits `93695c82e` + `c5182e88f`.)
 4. **Durable lock (eventual reproducibility PR).** The clean long-term fix is to
    add `aarch64` to `pyproject.toml [tool.uv] environments` and move the aarch64
    pins (open3d, decord gate) into `override-dependencies`, then `uv lock`. That
