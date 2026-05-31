@@ -50,7 +50,9 @@ if [ ! -f "${OVERRIDES}" ]; then
 fi
 
 echo "==> [1/4] Creating venv at ${VENV} (python ${PYVER})"
-uv venv "${VENV}" --python "${PYVER}"
+# --clear wipes any existing venv so reruns are a clean recreate (uv pip install
+# is additive, so without this stale packages from a prior run could survive).
+uv venv --clear "${VENV}" --python "${PYVER}"
 
 echo "==> [2/4] Installing cu130 CUDA torch (aarch64 GB10)"
 # Default PyPI torch on aarch64 is CPU-only; pull the cu130 aarch64 wheels.
@@ -58,7 +60,7 @@ uv pip install --python "${VENV}/bin/python" \
   --index-url https://download.pytorch.org/whl/cu130 \
   --extra-index-url https://pypi.org/simple \
   --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
-  torch torchvision torchaudio
+  torch==2.12.0+cu130 torchvision==0.27.0+cu130 torchaudio==2.11.0+cu130
 
 echo "==> [3/4] Installing capx [robosuite] extra with aarch64 overrides"
 # --overrides applies the open3d==0.18.0 pin + decord gate (+ mirrored pyproject
@@ -84,13 +86,28 @@ uv pip install --python "${VENV}/bin/python" \
 
 echo "==> Verifying imports"
 "${VENV}/bin/python" - <<'PY'
+import sys
 import torch, robosuite, curobo, open3d
-print("python", __import__("sys").version.split()[0])
+print("python", sys.version.split()[0])
 print("torch", torch.__version__, "cuda", torch.cuda.is_available(),
       torch.cuda.get_device_name(0) if torch.cuda.is_available() else "NO-CUDA")
 print("robosuite", robosuite.__version__)
 print("open3d", open3d.__version__)
 print("curobo OK")
+# Assert the architecture-critical invariants this setup documents; fail loudly
+# (non-zero exit) on any violation rather than silently printing a broken state.
+errs = []
+if not torch.cuda.is_available():
+    errs.append("torch is CPU-only (expected cu130 GPU build on GB10)")
+if open3d.__version__ != "0.18.0":
+    errs.append(f"open3d {open3d.__version__} != 0.18.0 (aarch64 cp311 pin)")
+try:
+    import decord  # noqa: F401
+    errs.append("decord is importable but must be gated out (sam3-train-only)")
+except ModuleNotFoundError:
+    pass
+if errs:
+    sys.exit("FAIL: " + "; ".join(errs))
 print("ROBOSUITE VENV OK")
 PY
 

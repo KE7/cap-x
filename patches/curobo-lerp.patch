@@ -18,7 +18,7 @@ index f0140ae..96d2e8d 100644
 @@ -1127,10 +1127,16 @@ inline __host__ __device__ uint4 max(uint4 a, uint4 b)
  // - linear interpolation between a and b, based on value t in [0, 1] range
  ////////////////////////////////////////////////////////////////////////////////
- 
+
 +// C++20 (<cmath>) introduces constexpr std::lerp(float,float,float); when a
 +// translation unit pulls it into global scope (`using namespace std;`) it
 +// collides with this identical-signature overload. Skip our scalar overload

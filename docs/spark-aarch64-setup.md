@@ -57,8 +57,9 @@ separate venvs. pyroki runs GPU JAX (numpy 2.x) which is incompatible with the
 benchmark venvs' numpy 1.26.4, so it is isolated and reached over HTTP.
 
 > † `scripts/setup_pyroki_venv.sh` and the launcher's per-venv routing currently
-> live on branch **`feat/pyroki-gpu-venv`** (not yet merged to `main`/this docs
-> branch). Until that lands, get the pyroki script from that branch.
+> live on branch **`feat/pyroki-gpu-venv`** (PR #2, not yet merged to `main`/this
+> docs branch). Until that lands, fetch the pyroki script from that branch first
+> (see §7) — the command blocks below will not exist on this branch otherwise.
 
 ---
 
@@ -91,10 +92,13 @@ uv pip install --python <venv>/bin/python \
   --index-url https://download.pytorch.org/whl/cu130 \
   --extra-index-url https://pypi.org/simple \
   --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio \
-  torch torchvision torchaudio
+  torch==2.12.0+cu130 torchvision==0.27.0+cu130 torchaudio==2.11.0+cu130
 ```
 
-Verified result on this box: **`torch 2.12.0+cu130`, `torch.cuda.is_available() == True`,
+The versions are pinned to the verified cu130 aarch64 cp311 wheel set so reruns
+are reproducible (the `+cu130` local tag exists only on the pytorch index, so it
+also disambiguates from the CPU-only PyPI wheels). Verified result on this box:
+**`torch 2.12.0+cu130`, `torch.cuda.is_available() == True`,
 device `NVIDIA GB10`** (torchvision 0.27.0, torchaudio 2.11.0).
 Source: build.nvidia.com/spark/isaac + DGX Spark porting guides.
 
@@ -151,7 +155,10 @@ out when `std::lerp` is available. The setup scripts apply it automatically; to
 apply by hand:
 
 ```bash
-git -C capx/third_party/curobo apply patches/curobo-lerp.patch
+# Run from the repo root. With `-C` the patch path is resolved from inside the
+# submodule, so use the repo-root-relative `../../../` prefix:
+git -C capx/third_party/curobo apply ../../../patches/curobo-lerp.patch
+# or, without -C:  git apply patches/curobo-lerp.patch --directory=capx/third_party/curobo
 # or:  ( cd capx/third_party/curobo && patch -p1 < ../../../patches/curobo-lerp.patch )
 ```
 
@@ -163,10 +170,15 @@ upstream). The patch file is the reproducible capture; consider upstreaming.
 ## 7. pyroki GPU service (`.venv-pyroki`)
 
 > **Note:** the `setup_pyroki_venv.sh` script and the `launch_servers.py`
-> per-venv routing live on branch **`feat/pyroki-gpu-venv`** and are not yet on
-> `main` (this docs branch). Run the script from that branch until it merges.
+> per-venv routing live on branch **`feat/pyroki-gpu-venv`** (PR #2) and are not
+> yet on `main` (this docs branch). The script does **not** exist on this branch
+> — fetch it from that branch first (or run this section after PR #2 merges):
 
 ```bash
+# Until feat/pyroki-gpu-venv (PR #2) merges, retrieve the script from that branch:
+git fetch origin feat/pyroki-gpu-venv
+git checkout origin/feat/pyroki-gpu-venv -- scripts/setup_pyroki_venv.sh
+# then run it:
 ./scripts/setup_pyroki_venv.sh
 ```
 
