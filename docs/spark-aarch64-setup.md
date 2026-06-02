@@ -132,8 +132,8 @@ One-liners (idempotent; safe to re-run; they recreate the venv):
 
 Each script: creates a **py3.11** venv → installs **cu130 torch** (§4) →
 `uv pip install --overrides scripts/overrides/aarch64-overrides.txt -e ".[<extra>]"`
-→ applies the **curobo lerp patch** (§ below) and builds editable curobo with
-`--no-build-isolation` against the cu130 torch → runs an import verify.
+→ installs curobo via `scripts/install_curobo.sh` (**prefers the prebuilt wheel**,
+falls back to a source build — § below) → runs an import verify.
 
 Verified final imports (libero venv, real output):
 ```
@@ -146,24 +146,41 @@ decord absent (expected, gated)
 robosuite venv is the same recipe with the `[robosuite]` extra (verify imports
 `torch, robosuite, curobo, open3d`).
 
-### The curobo lerp patch (`patches/curobo-lerp.patch`)
+### curobo install: prebuilt wheel, then source build (`scripts/install_curobo.sh`)
 
-curobo's CUDA extension fails to build under CUDA 13 because C++20's `constexpr
+curobo's CUDA extension takes **~20-40 min of nvcc** to compile on the Spark, and
+it fails to build under CUDA 13 out of the box because C++20's `constexpr
 std::lerp(float,float,float)` collides with curobo's identical-signature scalar
-overload. The tracked patch `patches/curobo-lerp.patch` guards curobo's overload
-out when `std::lerp` is available. The setup scripts apply it automatically; to
-apply by hand:
+overload. Both problems are now solved upstream of this repo:
+
+- The **fork** [`KE7/curobo`](https://github.com/KE7/curobo) (submodule, branch
+  `aarch64/cuda13-lerp-fix`, PR #1) carries the std::lerp guard **committed** in
+  `helper_math.h` — so no working-tree patch is needed, and
+  `patches/curobo-lerp.patch` is **dropped**.
+- A **prebuilt wheel** for this platform (cp311 / linux_aarch64 / CUDA 13 /
+  sm_121, torch 2.12.0+cu130) is published as a GitHub release on the fork:
+  <https://github.com/KE7/curobo/releases/tag/v-cu13-aarch64-30eafef>
+
+`scripts/install_curobo.sh <venv>` (called by the setup scripts) implements the
+**prebuilt-wheel-then-build** pattern: it downloads and installs the prebuilt
+wheel when the platform matches (skipping the nvcc build), and transparently
+falls back to a from-source build of the fork otherwise. Escape hatches:
 
 ```bash
-# Run from the repo root. With `-C` the patch path is resolved from inside the
-# submodule, so use the repo-root-relative `../../../` prefix:
-git -C capx/third_party/curobo apply ../../../patches/curobo-lerp.patch
-# or, without -C:  git apply patches/curobo-lerp.patch --directory=capx/third_party/curobo
-# or:  ( cd capx/third_party/curobo && patch -p1 < ../../../patches/curobo-lerp.patch )
+# Default: prefer the prebuilt wheel, fall back to source.
+scripts/install_curobo.sh .venv-libero
+
+# Force a from-source build (e.g. local curobo edits):
+CUROBO_FORCE_SOURCE=1 scripts/install_curobo.sh .venv-libero
+
+# Point at a different prebuilt wheel:
+CUROBO_WHEEL_URL=https://github.com/KE7/curobo/releases/download/<tag>/<wheel> \
+  scripts/install_curobo.sh .venv-libero
 ```
 
-This is currently a **working-tree edit to the curobo submodule** (not committed
-upstream). The patch file is the reproducible capture; consider upstreaming.
+To rebuild the prebuilt wheel for a new fork commit: build from a clean checkout
+with `TORCH_CUDA_ARCH_LIST=12.1+PTX` + CUDA 13 (`python -m pip wheel . --no-build-isolation`),
+then `gh release create v-cu13-aarch64-<shortsha> --repo KE7/curobo <wheel>`.
 
 ---
 
@@ -249,7 +266,7 @@ on py3.11.
 > `feat/omnigibson-3.8.0-isaac5.1` and is owned by a separate worker; this
 > section documents the wiring, it does not script it. Remaining gaps are about a
 > *fully-scored agent eval* (perception servers, LLM backend), **not** the motion
-> fix — see §10.
+> fix — see §11.
 
 **Key facts established on this box:**
 - The only Isaac Sim with an aarch64 build is **5.1.0**, **source-built** per the
@@ -262,13 +279,13 @@ on py3.11.
 
 **Isaac source build path (MACHINE-SPECIFIC — confirm per machine):**
 ```
-/home/batman/Documents/open-source/isaacsim/_build/linux-aarch64/release
+/path/to/isaacsim/_build/linux-aarch64/release
 ```
 
 **Wired env to import Isaac + OmniGibson from the b1k venv** (the venv is
 separate from the source-built Isaac; both are cp311):
 ```bash
-export ISAAC_PATH=/home/batman/Documents/open-source/isaacsim/_build/linux-aarch64/release
+export ISAAC_PATH=/path/to/isaacsim/_build/linux-aarch64/release
 export CARB_APP_PATH="$ISAAC_PATH/kit"
 export EXP_PATH="$ISAAC_PATH/apps"
 source "$ISAAC_PATH/setup_python_env.sh"     # sets PYTHONPATH + LD_LIBRARY_PATH
@@ -338,7 +355,179 @@ Isaac + GPU physics):
 
 ---
 
-## 10. Known gaps / TODO
+## 10. Running the benchmarks on Spark (operational runbook)
+
+This is the "how to run it correctly" section. The setup sections above build the
+venvs; this one is the rules + commands for an actual scored run on the GB10 head.
+
+### 10.1 Topology — keep the LLM OFF the head
+
+This is a **single-GPU box with 121 GB unified memory**. The simulator (Isaac),
+the perception servers, and the IK server all create CUDA contexts on the head
+GPU. **A co-located vLLM/LLM will OOM the head.** Keep the policy LLM on the peer
+Sparks.
+
+| Component | Where it runs |
+|---|---|
+| **vLLM / LLM policy server** | **PEER Sparks** (cluster, off the head) |
+| Perception (SAM3, ContactGraspNet) | **HEAD** |
+| pyroki IK server | **HEAD** (GPU JAX) |
+| Isaac Sim / OmniGibson + eval harness | **HEAD** |
+
+Bring the peer-hosted LLM up **only** via the documented `spark-vllm-docker` scripts
+(`hf-download.sh` / `run-recipe.sh` / `launch-cluster.sh`) — README at
+`/path/to/spark-vllm-docker` (+ `recipes/README.md`); do
+**not** hand-roll `docker run` / `vllm serve` / `ray`. Then point the eval at it with
+`--server-url` (OpenAI-compatible endpoint):
+
+```bash
+--model <served-model-name> --server-url http://<peer-host>:8000/v1/chat/completions
+```
+
+Oracle configs (`use_oracle_code: true`) need **no** LLM at all — they run fully on
+the head (§10.5). **Rule: never start a vLLM/LLM on the head while an eval is running.**
+
+### 10.2 Head servers — ports must not collide; pyroki is launched SEPARATELY
+
+The eval's `api_servers:` block (see [docs/configuration.md](configuration.md#perception-servers-api_servers))
+and `launch_servers.py --profile` auto-launch head servers and **skip any port
+already in use** (so you may pre-launch and share across runs). Defaults below are
+**examples, not mandates**; the only hard requirement is **no port collisions**:
+
+| Server | Module | Default port (example) | Venv |
+|---|---|---|---|
+| SAM3 | `capx.serving.launch_sam3_server` | 8114 | `.venv-libero` |
+| ContactGraspNet | `capx.serving.launch_contact_graspnet_server` | 8115 | `.venv-libero` |
+| pyroki IK | `capx.serving.launch_pyroki_server` | 8116 | **`.venv-pyroki` (GPU) — pre-launch ONLY** |
+
+> ⚠️ **Do NOT let the eval YAML / `launch_servers.py` auto-start pyroki.** On this
+> branch the orchestrator spawns every server with `sys.executable` (no per-venv
+> routing — that lives on `feat/pyroki-gpu-venv`, PR #2), and the `default`/`full`
+> profiles include pyroki. Auto-started from an eval venv, pyroki therefore runs
+> under the **eval's CPU-only JAX** (e.g. b1k) → the IK CPU **hang** §10.3 warns
+> about. **SAM3 + ContactGraspNet** may be auto-started/shared; **pyroki must be
+> pre-launched by hand on `.venv-pyroki`** so it gets the GPU `jax[cuda13]`.
+
+Pre-launch SAM3 + ContactGraspNet (these two only — let the YAML reuse them by port):
+
+```bash
+# SAM3 needs the decord stub on PYTHONPATH on aarch64 (no aarch64 decord wheel —
+# env-specific shim, NOT needed on a clean x86 install); see §8 + perception notes.
+PYTHONPATH=/path/to/sam3_stubs \
+  .venv-libero/bin/python -m capx.serving.launch_sam3_server            --device cuda --port 8114 --host 127.0.0.1
+.venv-libero/bin/python -m capx.serving.launch_contact_graspnet_server --device cuda --port 8115 --host 127.0.0.1
+```
+
+> ⚠️ **Stock `launch_pyroki_server` does not cleanly serve R1Pro on `.venv-pyroki`
+> as-is** (both verified on this box): (1) `import capx.serving.launch_pyroki_server`
+> under `.venv-pyroki` currently fails with `ModuleNotFoundError: No module named
+> 'gymnasium'` (it pulls the full `capx.integrations`/`capx.envs` import chain);
+> (2) its default URDF is `panda_description` / `panda_hand` — it serves a **Franka**
+> `/ik` route, not R1Pro. **The R1Pro GPU-pyroki launch mechanism is being finalized**
+> in the active oracle/fix loop — do not assert an R1Pro launch command here yet
+> (pending validation).
+
+> **KEY RULE — one pyroki server PER ROBOT FAMILY.** A pyroki IK server is built for
+> **one robot's URDF**. R1Pro and Franka are different robots → **separate** pyroki
+> servers, **never** shared. The stock launcher's default URDF is Franka/panda, so a
+> Franka eval (Robosuite/LIBERO) gets a Franka `/ik`; an **R1Pro pyroki on the same
+> port has no Franka `/ik` route** (the exact collision we hit). Run each family's
+> pyroki on a **distinct port** (e.g. Franka 8116, R1Pro 8126 — numbers arbitrary,
+> requirement is no collision) and point each eval at its family's port.
+
+### 10.3 pyroki MUST use the GPU JAX venv
+
+pyroki runs in its **own** venv `.venv-pyroki`, which has the **GPU** `jax[cuda13]`
+(jaxlib → `CudaDevice`). Reach it over HTTP — do **not** import/run IK in-process
+inside the benchmark venvs. (The R1Pro→GPU-pyroki launch/routing specifics are still
+under validation — see §10.2; treat as **pending**.)
+
+> ⚠️ **Never run IK in-process in the b1k venv.** Isaac's bundled JAX there is
+> **CPU-only** → IK falls back to CPU and **hangs** (frozen-log stall). Always go
+> through the pyroki HTTP server backed by `.venv-pyroki`.
+
+JAX pre-allocates ~75% of unified memory on start. When co-locating pyroki with the
+torch/perception servers on this single GPU, cap it so the head doesn't OOM:
+
+```bash
+export XLA_PYTHON_CLIENT_PREALLOCATE=false      # or XLA_PYTHON_CLIENT_MEM_FRACTION=0.2
+```
+
+### 10.4 BEHAVIOR / Isaac run wiring (head)
+
+BEHAVIOR runs from the b1k venv against the **source-built** aarch64 Isaac Sim 5.1
+(§9). Export this env before `launch.py` (Isaac path is **machine-specific** —
+confirm per box). The **PYTHONPATH shims are mandatory**: prepend the venv's
+`websockets` and `typing_extensions` so they win over Isaac's older bundled copies
+(Isaac's prebundled `typing_extensions` lacks `Sentinel`; without the prepend,
+imports break).
+
+```bash
+export ISAAC_PATH=/path/to/isaacsim/_build/linux-aarch64/release
+export CARB_APP_PATH="$ISAAC_PATH/kit"
+export EXP_PATH="$ISAAC_PATH/apps"
+source "$ISAAC_PATH/setup_python_env.sh"        # sets PYTHONPATH + LD_LIBRARY_PATH
+# shims FIRST so the venv copies win over Isaac's bundled ones:
+export PYTHONPATH="$WS_SHIM:$TE_SHIM:$PYTHONPATH"   # WS_SHIM=venv websockets, TE_SHIM=venv typing_extensions
+export LD_PRELOAD="/lib/aarch64-linux-gnu/libgomp.so.1:$ISAAC_PATH/kit/libcarb.so"  # libgomp = aarch64 quirk
+export OMNI_KIT_ACCEPT_EULA=YES OMNIGIBSON_HEADLESS=1 CUDA_HOME=/usr/local/cuda
+```
+
+### 10.5 Per-family run commands
+
+All families use the same launcher `capx/envs/launch.py` with a `--config-path`
+from `env_configs/`; only the **venv** (and BEHAVIOR's Isaac env) differ. Pick the
+config for the task; `--model`/`--server-url` point at the **peer** LLM (§10.1).
+
+**Oracle smoke-test (no LLM) — verify the substrate first.** Oracle configs run
+pre-defined code instead of querying a model, so they need **no** `--model`/`--server-url`
+and **no** peer. Use one to validate the venv + perception + pyroki wiring before
+spending an LLM run:
+
+```bash
+uv run --no-sync --active capx/envs/launch.py \
+    --config-path <oracle-config>.yaml \
+    --use-oracle-code True            # NO --model / --server-url; oracle needs no LLM
+```
+
+**Robosuite — main `.venv` (`[robosuite]` extra):**
+```bash
+uv run --no-sync --active capx/envs/launch.py \
+    --config-path env_configs/cube_stack/franka_robosuite_cube_stack.yaml \
+    --model <model> --server-url http://<peer-host>:8000/v1/chat/completions
+```
+
+> **Robosuite needs its OWN Franka pyroki server** (stock launcher's default URDF =
+> panda/Franka) on a **distinct port** per the §10.2 one-per-family rule. Pre-launch a
+> Franka pyroki and point this run at its port — do **not** reuse an R1Pro pyroki: it
+> has no Franka `/ik` route. (The GPU-venv pyroki launch mechanism is being finalized —
+> §10.2.)
+
+**LIBERO-PRO — `.venv-libero` (LIBERO-PRO fork, robosuite 1.4 + contact-graspnet):**
+```bash
+source .venv-libero/bin/activate
+uv run --no-sync --active capx/envs/launch.py \
+    --config-path env_configs/libero/franka_libero_spatial_0.yaml \
+    --model <model> --server-url http://<peer-host>:8000/v1/chat/completions
+```
+
+**BEHAVIOR R1Pro — b1k venv + Isaac wiring (§10.4):**
+```bash
+source capx/third_party/b1k/.venv/bin/activate
+# ... export the §10.4 Isaac env (ISAAC_PATH, shims, LD_PRELOAD, EULA, HEADLESS) ...
+OMNI_KIT_ACCEPT_EULA=YES OMNIGIBSON_HEADLESS=1 \
+uv run --no-sync --active capx/envs/launch.py \
+    --config-path env_configs/r1pro/r1pro_pick_up_radio.yaml \
+    --model <model> --server-url http://<peer-host>:8000/v1/chat/completions
+```
+
+> **BEHAVIOR GPU note:** Isaac selects its GPU via `OMNIGIBSON_GPU_ID` (not
+> `CUDA_VISIBLE_DEVICES`). On this single-GPU head everything shares GPU 0; watch
+> unified-memory headroom (Isaac + GPU pyroki + perception all on one GPU).
+
+---
+
+## 11. Known gaps / TODO
 
 1. **BEHAVIOR curobo — RESOLVED (no longer a blocker).** Root-caused to the
    OmniGibson Blackwell embodiment guard missing GB10 `(12,1)`; fixed in-process
@@ -357,7 +546,7 @@ Isaac + GPU physics):
    - **LLM backend for non-oracle configs.** Point the agent at the local Qwen
      vLLM at `:8000` (`Qwen/Qwen3.6-27B-FP8`) or OpenRouter; oracle configs
      (`use_oracle_code: true`) need no LLM key.
-2. **Machine-specific Isaac path** (`/home/batman/Documents/open-source/isaacsim/...`)
+2. **Machine-specific Isaac path** (`/path/to/isaacsim/...`)
    is hard-coded to this box — parameterize via `ISAAC_PATH` and confirm per machine.
 3. **`uv_install.sh` edits uncommitted** on the b1k branch; committing them (and a
    BEHAVIOR setup script) is pending coordination with the b1k owner. (The curobo

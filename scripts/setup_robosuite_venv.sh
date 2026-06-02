@@ -26,8 +26,6 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="${REPO_ROOT}/.venv"
 OVERRIDES="${REPO_ROOT}/scripts/overrides/aarch64-overrides.txt"
-CUROBO_DIR="${REPO_ROOT}/capx/third_party/curobo"
-CUROBO_PATCH="${REPO_ROOT}/patches/curobo-lerp.patch"
 PYVER="3.11"   # 3.11 (NOT 3.12): open3d==0.18.0 has no cp312 aarch64 wheel.
 
 # --- The shared cu130 / Blackwell build env (must be exported before any build) ---
@@ -71,18 +69,11 @@ uv pip install --python "${VENV}/bin/python" \
   --overrides "${OVERRIDES}" \
   -e "${REPO_ROOT}[robosuite]"
 
-echo "==> [4/4] Building editable curobo (CUDA 13 + lerp patch)"
-# Apply the lerp patch if not already applied (idempotent: --reverse --check
-# succeeds only when it is already applied).
-if git -C "${CUROBO_DIR}" apply --reverse --check "${CUROBO_PATCH}" 2>/dev/null; then
-  echo "    curobo lerp patch already applied; skipping."
-else
-  echo "    applying curobo lerp patch."
-  git -C "${CUROBO_DIR}" apply "${CUROBO_PATCH}"
-fi
-uv pip install --python "${VENV}/bin/python" \
-  --no-build-isolation --reinstall-package nvidia-curobo \
-  -e "${CUROBO_DIR}"
+echo "==> [4/4] Installing curobo (prefer prebuilt wheel, fall back to source build)"
+# Prefers the prebuilt CUDA-13/aarch64/sm_121 wheel from the KE7/curobo release
+# (skips the ~20-40 min nvcc build); falls back to a from-source build of the
+# fork. The fork carries the C++20 std::lerp guard committed, so no patch needed.
+"${REPO_ROOT}/scripts/install_curobo.sh" "${VENV}"
 
 echo "==> Verifying imports"
 "${VENV}/bin/python" - <<'PY'
