@@ -262,7 +262,7 @@ on py3.11.
 > — R1Pro warmup + plan PASS and a real `turning_on_radio` BEHAVIOR episode ran
 > end-to-end on the real GB10 (cap (12,1)), no crash. The fix is **three small
 > in-process patches** (below); there was **no CUDA-12.8-toolkit / out-of-process
-> / cuMotion requirement**. The b1k submodule work lives on branch
+> requirement**. The b1k submodule work lives on branch
 > `feat/omnigibson-3.8.0-isaac5.1` and is owned by a separate worker; this
 > section documents the wiring, it does not script it. Remaining gaps are about a
 > *fully-scored agent eval* (perception servers, LLM backend), **not** the motion
@@ -318,7 +318,7 @@ cuRobo embodiment on Blackwell, but its guard in
 its crashing `default` embodiment → illegal memory access in `lbfgs_step_cu`.
 
 **Fix — three small in-process patches on the b1k branch** (no CUDA 12.8 toolkit,
-no out-of-process server, no cuMotion):
+no out-of-process server):
 
 1. **Commit `93695c82e`** — widen the Blackwell guard from `== (12,0)` to
    `get_device_capability(device)[0] == 12` so it covers GB10 `(12,1)` (and all
