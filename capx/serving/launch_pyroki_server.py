@@ -171,7 +171,7 @@ _TARGET_LINK = None
 
 
 async def _run_in_thread(fn, *args, **kwargs):
-    """Run a blocking CPU-bound function without blocking the event loop."""
+    """Run a blocking GPU-bound function without blocking the event loop."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
@@ -305,7 +305,7 @@ def init_pyroki_server(
 
 
 def _do_solve_ik(target_pose_wxyz_xyz: np.ndarray, prev_cfg: np.ndarray | None) -> list[float]:
-    """Blocking IK solve (CPU-bound)."""
+    """Blocking IK solve (GPU-bound)."""
     if prev_cfg is None:
         q = pks.solve_ik(
             robot=_ROBOT,
@@ -342,7 +342,7 @@ async def solve_ik(req: IkRequest):
 
 
 def _do_plan_motion(req: PlanRequest) -> PlanResponse:
-    """Blocking motion planning (CPU-bound)."""
+    """Blocking motion planning (GPU-bound)."""
     start_pose = np.array(req.start_pose_wxyz_xyz, dtype=np.float64)
     end_pose = np.array(req.end_pose_wxyz_xyz, dtype=np.float64)
 

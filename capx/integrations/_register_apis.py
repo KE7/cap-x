@@ -1,4 +1,4 @@
-from .base_api import list_apis, register_api
+from .base_api import register_api
 from .franka.control import FrankaControlApi
 from .franka.control_privileged import FrankaControlPrivilegedApi
 from .franka.control_reduced import FrankaControlApiReduced
