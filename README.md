@@ -56,7 +56,8 @@ uv sync
 > `capx/third_party/b1k` are pinned to the [`KE7/curobo`](https://github.com/KE7/curobo)
 > and [`KE7/b1k`](https://github.com/KE7/b1k) forks, which carry the CUDA-13 / aarch64 /
 > Isaac 5.1 fixes (curobo's C++20 `std::lerp` guard; b1k camera-params / base-nav
-> fixes + an arch-gated `uv_install.sh`). `--recurse-submodules` and
+> fixes + a dual-arch `uv_install.sh` that installs Isaac Sim 5.1 on **both** x86_64
+> (cp311 wheels from pypi.nvidia.com) and aarch64 (source build)). `--recurse-submodules` and
 > `git submodule update --init --recursive` fetch from those forks automatically.
 
 ### Simulator-specific setup
@@ -83,9 +84,13 @@ See [docs/libero-tasks.md](docs/libero-tasks.md) for running any of 130+ LIBERO 
 
 #### BEHAVIOR (Isaac Sim)
 
-BEHAVIOR tasks run on NVIDIA Isaac Sim via OmniGibson. On the x86_64 / Isaac 4.5 path this requires Python 3.10 and CUDA 12.x; aarch64 / GB10 uses Isaac 5.1 (Python 3.11) per the [Spark guide](docs/spark-aarch64-setup.md).
+BEHAVIOR tasks run on NVIDIA Isaac Sim via OmniGibson. The BEHAVIOR venv (`capx/third_party/b1k/.venv`, created by the b1k `uv_install.sh`) is now a **single unified stack — OmniGibson 3.8.0 / Isaac Sim 5.1 / Python 3.11 (cp311)** on **both** architectures: x86_64 installs the Isaac Sim 5.1 cp311 wheels from pypi.nvidia.com, while aarch64 / GB10 reuses a source-built Isaac Sim 5.1 (see the [Spark guide](docs/spark-aarch64-setup.md)). (This is independent of the root Robosuite venv above, which stays on Python 3.10.)
 
-> **`ISAAC_PATH` is environment-provided** (no hardcoded default): on aarch64 the b1k `uv_install.sh` reuses a source-built Isaac Sim 5.1 release tree pointed to by `$ISAAC_PATH` (it auto-detects a repo-relative build, otherwise requires the env var). **cuRobo installs wheel-first**: the aarch64 path prefers the prebuilt [`KE7/curobo`](https://github.com/KE7/curobo/releases) CUDA-13 wheel and falls back to a source build via `scripts/install_curobo.sh` — see the [Spark guide](docs/spark-aarch64-setup.md). The x86_64 instructions below are unchanged.
+> **Architecture handling in `uv_install.sh`:** the script detects `uname -m` and installs Isaac Sim 5.1 for either arch.
+> - **x86_64:** installs `isaacsim[all,extscache]==5.1.0` (cp311 wheels, `--extra-index-url https://pypi.nvidia.com`); `ISAAC_PATH` is configured by the installed wheels.
+> - **aarch64:** **`ISAAC_PATH` is environment-provided** (no hardcoded default) — the script reuses a source-built Isaac Sim 5.1 release tree pointed to by `$ISAAC_PATH` (auto-detects a repo-relative build, otherwise requires the env var), because no aarch64 Isaac Sim wheels are published.
+>
+> **cuRobo installs wheel-first** (aarch64): the aarch64 path prefers the prebuilt [`KE7/curobo`](https://github.com/KE7/curobo/releases) CUDA-13 wheel and falls back to a source build via `scripts/install_curobo.sh` — see the [Spark guide](docs/spark-aarch64-setup.md).
 
 ```bash
 cd capx/third_party/b1k
