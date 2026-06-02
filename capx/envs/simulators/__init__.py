@@ -2,8 +2,14 @@
 from capx.envs.base import list_envs, register_env
 
 
-from .franka_real import FrankaRealLowLevel
-register_env("franka_real_low_level", FrankaRealLowLevel)
+try:
+    from .franka_real import FrankaRealLowLevel
+    register_env("franka_real_low_level", FrankaRealLowLevel)
+except Exception:
+    # franka_real (real-robot teleop) needs viser; not required for BEHAVIOR/sim
+    # eval. Guard the import so an unrelated viser/websockets issue doesn't block
+    # registration of the other (BEHAVIOR) environments.
+    print("Franka real (viser) not available!")
 
 # NOTE: Can only have one of Robosuite or LIBERO installed at a time!
 # Using Robosuite run: uv sync --extra robosuite
