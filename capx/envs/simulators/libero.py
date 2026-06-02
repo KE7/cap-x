@@ -77,6 +77,16 @@ class FrankaLiberoEnv(BaseEnv):
         self._current_reward = None
         self._current_done = None
 
+        # Render-on-read optimization state. The blocking primitive loops
+        # (move_to_joints_blocking, _step_once) step env.step many times but the
+        # agent only consumes camera pixels via get_observation() at the *end* of
+        # a primitive. We disable the camera observables so env.step skips the
+        # wasted offscreen render, and force a fresh render-on-read inside
+        # get_observation(). Populated/refreshed in reset() (observables are
+        # recreated on env.reset()).
+        self._camera_obs_names: list[str] = []
+        self._camera_obs_enabled: bool = True
+
         # Video capture
         self._record_frames = False
         self._frame_buffer: list[np.ndarray] = []
@@ -175,6 +185,14 @@ class FrankaLiberoEnv(BaseEnv):
         self._current_joints = self.handle.env.sim.data.qpos[:7].copy()
         self.home_joint_position = np.array(libero_obs["robot0_joint_pos"], dtype=np.float64)
         self._gripper_fraction = 1.0
+
+        # Render-on-read: disable camera observables so the settle loop below and
+        # the subsequent blocking primitive loops skip the per-step offscreen
+        # render whose frames are discarded. get_observation() force-renders a
+        # fresh frame on demand. Observables are recreated by env.reset(), so we
+        # (re-)derive the names and disable them here on every reset.
+        self._init_camera_observable_names()
+        self._set_camera_observables(False)
 
         # Post-reset settling: let physics stabilize (objects drop, joints settle).
         # 10 steps suffice — joints converge by step ~5.
@@ -429,8 +447,57 @@ class FrankaLiberoEnv(BaseEnv):
     def compute_reward(self) -> float:
         return self._current_reward
 
+    def _init_camera_observable_names(self) -> None:
+        """Identify the render-bearing camera observables (rgb / depth / segmentation).
+
+        These are the observables whose sensors trigger an offscreen render inside
+        robosuite's per-step ``_update_observables``. Re-derived after every
+        env.reset() because robosuite recreates the observable objects on reset.
+        """
+        robo = self.handle.env.env
+        self._camera_obs_names = [
+            nm
+            for nm in robo._observables
+            if nm.endswith("_image") or nm.endswith("_depth") or "_segmentation_" in nm
+        ]
+
+    def _set_camera_observables(self, enabled: bool) -> None:
+        """Enable/disable the camera observables so env.step renders / skips render.
+
+        When disabled, robosuite's ``Observable.update`` short-circuits before
+        calling the camera sensor, so no offscreen render fires during env.step.
+        State used by the primitive loops (joint qpos, object poses) comes from
+        ``sim.data``, not from these observables, so the loops are unaffected.
+        """
+        robo = self.handle.env.env
+        for nm in self._camera_obs_names:
+            robo.modify_observable(nm, "enabled", enabled)
+            robo.modify_observable(nm, "active", enabled)
+        self._camera_obs_enabled = enabled
+
+    def _refresh_camera_obs(self) -> None:
+        """Render-on-read: render fresh camera pixels for the *current* sim state.
+
+        Mirrors the known-good ``regenerate_obs_from_state`` path (sim.forward +
+        force update + _get_observations) without stepping/altering the
+        simulation, so the produced frame is identical to what a per-step render
+        at this same state would have produced. No-op if cameras are already live.
+        """
+        if self._camera_obs_enabled:
+            return  # cameras already rendered this step; _current_obs is current
+        robo = self.handle.env.env
+        self._set_camera_observables(True)
+        robo.sim.forward()
+        robo._update_observables(force=True)
+        self._current_obs = robo._get_observations()
+        self._set_camera_observables(False)
+
     def get_observation(self) -> dict[str, Any]:
         """Get observation in FrankaLiberoEnv format."""
+        # Render-on-read: camera rendering is skipped during the blocking
+        # primitive loops; produce a fresh camera frame for the current sim state
+        # now, exactly when the agent actually consumes the pixels.
+        self._refresh_camera_obs()
         obs = {}
 
         camera_names = [
