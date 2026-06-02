@@ -483,8 +483,12 @@ class FrankaLiberoEnv(BaseEnv):
         simulation, so the produced frame is identical to what a per-step render
         at this same state would have produced. No-op if cameras are already live.
         """
+        # Defensive guard for an enabled-cameras configuration not used today: if
+        # cameras ever stay live across steps, _current_obs already holds this step's
+        # render so we skip the re-render. Not reached on the current path, where
+        # cameras are disabled during stepping and re-enabled only inside this method.
         if self._camera_obs_enabled:
-            return  # cameras already rendered this step; _current_obs is current
+            return
         robo = self.handle.env.env
         self._set_camera_observables(True)
         robo.sim.forward()
