@@ -20,6 +20,7 @@ from typing import Any, List
 
 import numpy as np
 import pyroki as pk  # type: ignore
+import tyro
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -168,6 +169,12 @@ app = FastAPI()
 _ROBOT = None
 _ROBOT_COLL = None
 _TARGET_LINK = None
+# Selected compute device. The pyroki IK/plan server runs on GPU-enabled JAX
+# (jax[cuda13]); JAX binds its platform at import time and selects the GPU from
+# the CUDA_VISIBLE_DEVICES env var that the unified launcher sets per process.
+# This global mirrors the sam3/graspnet servers' `_DEVICE` for parity and is set
+# from the --device CLI flag the launcher emits for GPU-required servers.
+_DEVICE: str = "cuda"
 
 
 async def _run_in_thread(fn, *args, **kwargs):
@@ -393,10 +400,29 @@ def main(
     target_link: str = "panda_hand",
     port: int = 8116,
     host: str = "127.0.0.1",
+    device: str = "cuda",
 ):
+    global _DEVICE
+
+    # Record the requested device. The launcher conveys GPU selection for this
+    # jax[cuda13] server via CUDA_VISIBLE_DEVICES (set per-subprocess) and passes
+    # --device cuda for parity with the other GPU servers; JAX has already bound
+    # the visible GPU at import time, so we surface the choice rather than
+    # re-binding it here.
+    _DEVICE = device
+
+    logger.info(
+        "Starting pyroki server on %s:%d (device=%s, robot=%s, target_link=%s)",
+        host,
+        port,
+        device,
+        robot,
+        target_link,
+    )
+
     init_pyroki_server(robot_urdf_name=robot, target_link_name=target_link)
     uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
-    main()
+    tyro.cli(main)
