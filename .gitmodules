@@ -20,7 +20,7 @@
 	branch = main
 [submodule "capx/third_party/curobo"]
 	path = capx/third_party/curobo
-	url = https://github.com/NVlabs/curobo.git
+	url = https://github.com/KE7/curobo.git
 [submodule "capx/third_party/b1k"]
 	path = capx/third_party/b1k
-	url = https://github.com/qingh097/b1k.git
+	url = https://github.com/KE7/b1k.git
