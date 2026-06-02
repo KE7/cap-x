@@ -233,7 +233,8 @@ def get_navigation_pose(P_table, P_radio):
     else:
         outward = n2
         
-    buffer_distance = 0.3
+    buffer_distance = 0.5   # >= R1Pro chassis radius (~0.41 m) + activation + margin, so the
+                            # base footprint clears the support furniture instead of standing in it
     base_xy = p_edge_xy + outward * buffer_distance
     
     dx, dy = radio_xy - base_xy

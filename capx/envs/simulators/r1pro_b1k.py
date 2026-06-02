@@ -1170,7 +1170,8 @@ def get_navigation_pose(P_table, P_radio):
     else:
         outward = n2
         
-    buffer_distance = 0.3
+    buffer_distance = 0.5   # >= R1Pro chassis radius (~0.41 m) + activation + margin, so the
+                            # base footprint clears the support furniture instead of standing in it
     base_xy = p_edge_xy + outward * buffer_distance
     
     dx, dy = radio_xy - base_xy
@@ -1269,7 +1270,15 @@ if __name__ == "__main__":
         P_radio  = backproject_depth(np.array(radio_mask), np.array(ego_depth), np.array(intrinsic_matrix), T_world_cam)   # (Nr, 3)
         
         goal = get_navigation_pose(P_table, P_radio)
-        env._navigate_to_pose(goal)
+        # Validate the computed standoff goal against the live BASE collision world: with the
+        # full-body BASE collision check now ON (b1k PR#4), _navigate_to_pose plans WITH obstacles
+        # and returns False if cuRobo refuses the goal (e.g. the perceived table hull under-covers
+        # the support furniture and the standoff still lands the footprint in collision). On
+        # failure, fall back to the validated sampler, which samples collision-free base poses
+        # around the object (BASE embodiment, obstacles active) via _sample_pose_near_object.
+        nav_ok = env._navigate_to_pose(goal)
+        if not nav_ok:
+            env._navigate_to_obj("radio_89")
         
         robot_pos, robot_quat = env.robot.get_position_orientation()
         grasp_obj = env.env.scene.object_registry("name", "radio_89")
