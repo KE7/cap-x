@@ -4,9 +4,9 @@ BEHAVIOR tasks use the [BEHAVIOR-1K](https://behavior.stanford.edu/) benchmark v
 
 ## Prerequisites
 
-- Python 3.10
-- NVIDIA GPU with CUDA 12.x
-- Isaac Sim 4.5.0 (installed via `uv_install.sh`)
+- Python 3.11 (cp311 — the BEHAVIOR venv built by `uv_install.sh`, both architectures)
+- NVIDIA GPU with CUDA 12.x driver (`uv_install.sh` auto-handles PyTorch CUDA compat — see [PyTorch CUDA version mismatch](#troubleshooting))
+- Isaac Sim 5.1 + OmniGibson 3.8.0 (x86_64: cp311 wheels installed by `uv_install.sh`; aarch64: source-built Isaac Sim 5.1 — see the [Spark guide](spark-aarch64-setup.md))
 
 ## Installation
 
@@ -196,6 +196,14 @@ uv run --no-sync --active capx/envs/launch.py \
     --config-path env_configs/r1pro/r1pro_pick_up_radio_multiturn_vdm.yaml
 ```
 
+## Motion-generator backend
+
+The R1Pro low-level env plans arm motions with the native StanfordVL cuRobo
+`CuRoboMotionGenerator` (`omnigibson.action_primitives.curobo`). It is built
+automatically by `R1ProBehaviourLowLevel` via
+`capx.envs.simulators.r1pro_b1k.build_motion_generator()` — there is nothing to
+configure (incl. the sm_12x embodiment guard in `action_primitives/curobo`).
+
 ## Architecture
 
 BEHAVIOR tasks use the following components:
@@ -223,10 +231,10 @@ uv run --no-sync --active python -m capx.serving.launch_contact_graspnet_server 
 - If possible, run servers and behavior on different GPUs.
 - **SAM3 "returned no results" on most trials** — If SAM3 perception fails frequently, check that the SAM3 server is NOT filtering low-confidence detections. The server should return ALL detections (the control API applies its own threshold). On multi-GPU systems, consider running SAM3 on a separate GPU from Isaac Sim (e.g., `device: cuda:1` in the YAML config) to avoid memory contention.
 - **`ModuleNotFoundError: No module named 'omnigibson'`** — Run `./uv_install.sh` from `capx/third_party/b1k/`.
-- **`ModuleNotFoundError: No module named 'isaacsim'`** — Isaac Sim wheels not installed. Re-run `./uv_install.sh`.
+- **`ModuleNotFoundError: No module named 'isaacsim'`** — Isaac Sim not installed/importable. Re-run `./uv_install.sh` (x86_64 installs the Isaac Sim 5.1 cp311 wheels; aarch64 reuses the source build at `$ISAAC_PATH`).
 - **`OMNI_KIT_ACCEPT_EULA` error** — Set `export OMNI_KIT_ACCEPT_EULA=YES` before running.
 - **Segfault in XR extension on headless servers** — Set `export OMNIGIBSON_HEADLESS=1`. If still crashing, check for duplicate Vulkan ICDs: `ls /etc/vulkan/icd.d/ /usr/share/vulkan/icd.d/` — if `nvidia_icd.json` exists in both, remove the one in `/usr/share/vulkan/icd.d/`.
-- **cuRobo JIT compilation fails with `fatal error: helper_math.h`** — Copy missing headers: `cp capx/third_party/curobo/src/curobo/curobolib/cpp/*.h .venv/lib/python3.10/site-packages/curobo/curobolib/cpp/`
+- **cuRobo JIT compilation fails with `fatal error: helper_math.h`** — Copy missing headers: `cp capx/third_party/curobo/src/curobo/curobolib/cpp/*.h .venv/lib/python3.11/site-packages/curobo/curobolib/cpp/`
 - **Rendering errors on headless servers** — Install `libegl1 libgl1` and ensure GPU is accessible.
 - **Websockets conflict** — The install script auto-fixes this. If you see websockets errors, manually remove `pip_prebundle/websockets` directories under Isaac Sim's `extscache/`.
 - **First run is slow** — cuRobo JIT-compiles CUDA kernels on first import (~5 min). Subsequent runs use cached kernels. Set `TORCH_CUDA_ARCH_LIST` to your GPU's compute capability (e.g., `8.9` for L40/Ada) to speed up compilation.
