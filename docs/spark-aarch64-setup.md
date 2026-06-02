@@ -8,6 +8,15 @@ apply. It supersedes the ad-hoc `VENV_SETUP_HANDOFF.md` that previously lived
 > If you are on a normal x86_64 + CUDA 12.x machine, follow the
 > [README Installation](../README.md#installation) instead — this guide is for
 > the ARM/Spark path only.
+>
+> **Note (BEHAVIOR stack):** Isaac Sim **5.1** / OmniGibson **3.8.0** / Python
+> **3.11** is now the unified BEHAVIOR stack on **both** architectures. The only
+> per-arch difference is how Isaac Sim 5.1 is obtained: **x86_64** installs the
+> published cp311 wheels (`isaacsim[all,extscache]==5.1.0` from pypi.nvidia.com,
+> handled automatically by `b1k/uv_install.sh`), while **aarch64 / Spark**
+> **source-builds** Isaac Sim 5.1 (no aarch64 wheels are published) and reuses it
+> via `$ISAAC_PATH`. This guide is the aarch64 source-build deep-dive; x86_64 users
+> get 5.1 from wheels per the README and do not need the source build below.
 
 ---
 
@@ -70,8 +79,11 @@ benchmark venvs' numpy 1.26.4, so it is isolated and reached over HTTP.
 | `open3d==0.18.0` is the only open3d with an aarch64 linux wheel covering cp311 (cp38–cp311). 0.19.0 has no aarch64 wheel; **no cp312 wheel at any version**. | benchmark venvs = **3.11** (3.12 would require an open3d source build) |
 | Isaac Sim 5.1 (the only Isaac with an aarch64 build, source-built for Spark) bundles **Python 3.11** (kit 107 dropped cp310). | BEHAVIOR venv = **3.11** |
 
-The README's "Requires Python 3.10" line is for the x86 path and is **stale on
-this box**.
+The README's "Requires Python 3.10" line is for the x86_64 **base / Robosuite**
+venv (which legitimately stays on 3.10); it is **stale on this box**, where every
+venv — including the base venv — is **3.11**. Note the BEHAVIOR venv is **3.11 on
+both** architectures now (Isaac Sim 5.1 / OG 3.8.0 are cp311 everywhere); only the
+x86_64 base/Robosuite venv remains 3.10.
 
 ---
 
