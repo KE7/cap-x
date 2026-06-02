@@ -196,6 +196,14 @@ uv run --no-sync --active capx/envs/launch.py \
     --config-path env_configs/r1pro/r1pro_pick_up_radio_multiturn_vdm.yaml
 ```
 
+## Motion-generator backend
+
+The R1Pro low-level env plans arm motions with the native StanfordVL cuRobo
+`CuRoboMotionGenerator` (`omnigibson.action_primitives.curobo`). It is built
+automatically by `R1ProBehaviourLowLevel` via
+`capx.envs.simulators.r1pro_b1k.build_motion_generator()` — there is nothing to
+configure (incl. the sm_12x embodiment guard in `action_primitives/curobo`).
+
 ## Architecture
 
 BEHAVIOR tasks use the following components:
