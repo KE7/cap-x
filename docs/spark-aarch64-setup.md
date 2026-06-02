@@ -289,10 +289,14 @@ on py3.11.
 - On OmniGibson 3.8.0 the pymeshlab pin is arch-split, so aarch64 resolves
   **`pymeshlab 2025.7.post1`** automatically (no manual edit needed).
 
-**Isaac source build path (MACHINE-SPECIFIC — confirm per machine):**
+**Isaac source build path (per-machine VALUE — set/confirm per box):**
 ```
 /path/to/isaacsim/_build/linux-aarch64/release
 ```
+The *value* is intrinsically machine-specific, but the *entry point is
+parameterized*: `b1k/uv_install.sh` (KE7 PR #3) resolves it from `$ISAAC_PATH`
+first, else autodetects it repo-relative — you only set the value, nothing is
+hard-coded.
 
 **Wired env to import Isaac + OmniGibson from the b1k venv** (the venv is
 separate from the source-built Isaac; both are cp311):
@@ -307,11 +311,21 @@ export OMNI_KIT_ACCEPT_EULA=YES OMNIGIBSON_HEADLESS=1 CUDA_HOME=/usr/local/cuda
 Verified under this env: `import isaacsim` (source build), `import omnigibson` ==
 `3.8.0`, and Isaac's bundled `torch 2.7.0+cu128` reports `cuda True`.
 
-**`uv_install.sh` edits (working-tree on the b1k branch, NOT yet committed):**
-- `PYTHON_VERSION` 3.10 → **3.11**.
-- **Skip** the x86_64 Isaac 4.5 cp310 wheel download/install block — reuse the
-  source-built aarch64 Isaac 5.1 instead.
-- Relax the guard that aborts when `ISAAC_PATH`/`EXP_PATH` are set; export them.
+**`uv_install.sh` aarch64 port — now committed in [`KE7/b1k` PR #3](https://github.com/KE7/b1k/pull/3)**
+(branch `fix/aarch64-uv-install-isaac51-source-build`, head `61d8af9e`; OPEN, not
+yet merged — cap-x's b1k submodule still pins `qingh097/b1k@272ec5ca`, so the
+submodule repoint is the remaining step, tracked by cap-x PR #6
+`build/submodule-repoint-ke7-forks`). What the port does:
+- `PYTHON_VERSION` 3.10 → **3.11** (Config block).
+- Arch-split: on **aarch64**, **skip** the x86_64 Isaac Sim 5.1 cp311 wheel
+  download (`isaacsim[all,extscache]==5.1.0` from pypi.nvidia.com) and **reuse**
+  the source-built aarch64 Isaac 5.1 instead.
+- **`ISAAC_PATH` is parameterized** (not hard-coded): resolved from the
+  environment first (preferred, fully overridable), else **repo-relative
+  autodetect** at `$WORKDIR[/..]/isaacsim/_build/linux-aarch64/release`, else a
+  clear error with guidance. `EXP_PATH`/`CARB_APP_PATH` are derived from it. The
+  legacy "abort if Isaac env vars are set" guard now applies **only** to the
+  x86_64 wheel path.
 - Rewire the verify step to `source $ISAAC_PATH/setup_python_env.sh` + the
   `LD_PRELOAD` above; make it non-fatal.
 
@@ -364,6 +378,14 @@ Isaac + GPU physics):
   crash) — no illegal-memory crash.
 - Dataset in place: BEHAVIOR-1K assets (33 GB) + 2025 challenge task instances
   (400 MB) downloaded to `capx/third_party/b1k/datasets`.
+
+> **Validated-task scope (honest):** `turning_on_radio` is the BEHAVIOR task whose
+> cuRobo motion-gen path was driven **end-to-end** on the real GB10 (the 31-waypoint
+> trajectory above). `picking_up_trash` — config present at
+> `env_configs/r1pro/r1pro_pick_up_trash{,_oracle,_multiturn_vdm}.yaml` — has **not
+> yet** had a motion-gen E2E run on this box; it is **deferred**, not validated. The
+> in-process cuRobo fix is task-agnostic (it lives in the embodiment guard, not the
+> task), so `picking_up_trash` is expected to work, but that is **unverified** here.
 
 ---
 
@@ -558,11 +580,18 @@ uv run --no-sync --active capx/envs/launch.py \
    - **LLM backend for non-oracle configs.** Point the agent at the local Qwen
      vLLM at `:8000` (`Qwen/Qwen3.6-27B-FP8`) or OpenRouter; oracle configs
      (`use_oracle_code: true`) need no LLM key.
-2. **Machine-specific Isaac path** (`/path/to/isaacsim/...`)
-   is hard-coded to this box — parameterize via `ISAAC_PATH` and confirm per machine.
-3. **`uv_install.sh` edits uncommitted** on the b1k branch; committing them (and a
-   BEHAVIOR setup script) is pending coordination with the b1k owner. (The curobo
-   fix itself is done and committed — see §9 commits `93695c82e` + `c5182e88f`.)
+2. **Isaac path — parameterized (no longer a code TODO).** The `ISAAC_PATH`
+   parameterization landed in [`KE7/b1k` PR #3](https://github.com/KE7/b1k/pull/3)
+   (`uv_install.sh` resolves `$ISAAC_PATH` from the env, else autodetects it
+   repo-relative — §9). Only the path **value** is intrinsically per-machine; set it
+   per box. Nothing is hard-coded.
+3. **`uv_install.sh` aarch64 port — committed, merge pending.** The edits are
+   **committed** in `KE7/b1k` PR #3 (branch `fix/aarch64-uv-install-isaac51-source-build`,
+   head `61d8af9e`; OPEN). The remaining step is the **submodule repoint** — cap-x's
+   b1k submodule still pins `qingh097/b1k@272ec5ca`; tracked by cap-x PR #6
+   (`build/submodule-repoint-ke7-forks`). The curobo fix is likewise done and
+   committed — see §9 commits `93695c82e` + `c5182e88f`.
+   `picking_up_trash` motion-gen E2E remains **unrun** (radio is the validated task; §9).
 4. **Durable lock (eventual reproducibility PR).** The clean long-term fix is to
    add `aarch64` to `pyproject.toml [tool.uv] environments` and move the aarch64
    pins (open3d, decord gate) into `override-dependencies`, then `uv lock`. That
