@@ -1,8 +1,8 @@
-"""Low-level Robosuite Franka environment compatible with FrankaControlApi.
+"""Low-level R1Pro BEHAVIOR-1K environment compatible with FrankaControlApi.
 
-This module provides a thin wrapper around Robosuite's Stack environment
-that implements the same interface as FrankaPickPlaceLowLevel, making it
-hot-swappable for code execution environments.
+This module provides a thin wrapper around OmniGibson's BEHAVIOR-1K R1Pro
+task environment (R1ProBehaviourLowLevel) that implements the same low-level
+control interface, making it hot-swappable for code execution environments.
 """
 
 from __future__ import annotations
@@ -159,8 +159,8 @@ class R1ProBehaviourLowLevel(BaseEnv):
         # string now, before env construction rewrites it. (OG 3.8.0 dropped robot.model_name.)
         self._robot_type_name = self.controller_cfg["robots"][0]["type"]
         # aarch64 (DGX Spark / GB10): Isaac's omni.replicator.core OgnInstanceSegmentation::compute
-        # segfaults during the synthetic-data render (known aarch64 Isaac bug, see
-        # docs/spark-aarch64-setup.md §10). The scored trial perception path uses SAM3 on RGB
+        # segfaults during the synthetic-data render (known aarch64 Isaac bug). The scored
+        # trial perception path uses SAM3 on RGB
         # (privileged=false); the sim's seg_* modality is only consumed by the __main__ demo, so we
         # drop seg_* modalities on aarch64 to avoid the crash while keeping rgb/depth/proprio.
         import platform as _platform
