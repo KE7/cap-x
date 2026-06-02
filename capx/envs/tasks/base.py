@@ -1,9 +1,12 @@
 import contextlib
+import importlib
 import io
+import os
 import sys
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, SupportsFloat
 
 import numpy as np
@@ -80,6 +83,51 @@ class SimpleExecutor:
             return {"ok": True, "result": g.get("RESULT")}
         except BaseException as exc:  # defensive; propagate minimal info
             return {"ok": False, "error": repr(exc)}
+
+    def run_package(
+        self, pkg_dir: Path, *, inputs: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Package-mode counterpart of :meth:`run`.
+
+        Treat ``pkg_dir`` as a Python package: put its parent on ``sys.path``,
+        import ``<pkg_name>.main``, and call ``main.run(ctx)`` with the same
+        globals dict the string path would see. The package and its submodules
+        are purged from ``sys.modules`` before import so a caller that mutates
+        the package source between calls sees fresh behavior. Returns the same
+        ``{"ok": bool, "result": Any}`` contract as :meth:`run` on success, or
+        ``{"ok": False, "error": repr(exc)}`` on failure.
+        """
+        g: dict[str, Any] = {
+            "__name__": "__main__",
+            "env": self._env,
+            "APIS": self._apis,
+            "INPUTS": inputs or {},
+            "RESULT": None,
+        }
+        parent = str(pkg_dir.parent)
+        pkg_name = pkg_dir.name
+        path_was_added = False
+        if parent not in sys.path:
+            sys.path.insert(0, parent)
+            path_was_added = True
+        try:
+            # Purge cached submodules so source edits between calls take effect.
+            for mod_name in list(sys.modules):
+                if mod_name == pkg_name or mod_name.startswith(f"{pkg_name}."):
+                    del sys.modules[mod_name]
+            main_mod = importlib.import_module(f"{pkg_name}.main")
+            if not hasattr(main_mod, "run"):
+                raise AttributeError(
+                    f"{pkg_name}.main must define `run(ctx)` — got module "
+                    f"with attrs: {sorted(vars(main_mod).keys())[:20]}"
+                )
+            result = main_mod.run(g)
+            return {"ok": True, "result": result if result is not None else g.get("RESULT")}
+        except BaseException as exc:  # defensive; propagate minimal info
+            return {"ok": False, "error": repr(exc)}
+        finally:
+            if path_was_added and parent in sys.path:
+                sys.path.remove(parent)
 
 
 class CodeExecutionEnvBase(Env):
@@ -184,6 +232,110 @@ class CodeExecutionEnvBase(Env):
             "result": self._exec_globals.get("RESULT"),
         }
 
+    def _exec_user_package(self, pkg_dir: Path) -> dict[str, Any]:
+        """Package-mode equivalent of :meth:`_exec_user_code`.
+
+        Treats ``pkg_dir`` as a Python package. Adds its parent to ``sys.path``,
+        imports ``<pkg_name>.main``, and calls ``main.run(ctx)`` where ``ctx``
+        is the same persistent-globals dict the string-exec path uses. Returns
+        the same ``{ok, stdout, stderr, result}`` contract as
+        :meth:`_exec_user_code`.
+
+        The package is re-imported on every call (``sys.modules`` entries for
+        the package and its submodules are purged before import) so callers
+        whose package source is mutated between calls see the fresh version.
+
+        Risks and mitigations for this execution path:
+
+        * Existing callers regress — the public dispatcher only branches on
+          ``isinstance(Path) or isdir(str)``; plain code strings hit the
+          unchanged :meth:`_exec_user_code` path byte-for-byte.
+        * Import cache pollution across calls in one worker — the ``sys.modules``
+          purge below forces a fresh reload of every submodule on each call.
+        * User package does expensive work at import time — that cold-start
+          cost is paid per call. Acceptable for per-call evaluators; an
+          opt-in cache could be added later if needed.
+        * Two workers race on ``sys.path`` — cap-x workers are separate
+          processes (not threads), so there is no shared ``sys.path`` mutation.
+        * ``main.run()`` raises — caught by the same ``except BaseException``
+          as the string-mode path; traceback is written to the stderr buffer
+          and ``ok=False`` is returned.
+        * ``main.run()`` returns ``None`` but mutates ``RESULT`` in the ctx —
+          the final return falls back to ``self._exec_globals.get("RESULT")``
+          so both conventions are supported.
+        """
+        obs = self._get_observation()
+        # Update dynamic obs while retaining previously defined variables
+        self._exec_globals["obs"] = obs
+        self._exec_globals["env"] = self.low_level_env
+        self._exec_globals["APIS"] = self._apis
+        # Ensure API helper functions remain bound/current
+        for api in self._apis.values():
+            for fn_name, fn in api.functions().items():
+                self._exec_globals[fn_name] = fn
+
+        parent = str(pkg_dir.parent)
+        pkg_name = pkg_dir.name
+
+        stdout_buffer = io.StringIO()
+        tee_out = Tee(sys.stdout, stdout_buffer)
+        stderr_buffer = io.StringIO()
+        tee_err = Tee(sys.stderr, stderr_buffer)
+
+        ok = True
+        result: Any = None
+        path_was_added = False
+        if parent not in sys.path:
+            sys.path.insert(0, parent)
+            path_was_added = True
+
+        try:
+            with (
+                contextlib.redirect_stdout(tee_out),
+                contextlib.redirect_stderr(tee_err),
+            ):
+                # Force fresh import on every call — caller's package source
+                # may have changed between calls inside the same worker.
+                for mod_name in list(sys.modules):
+                    if mod_name == pkg_name or mod_name.startswith(f"{pkg_name}."):
+                        del sys.modules[mod_name]
+
+                main_mod = importlib.import_module(f"{pkg_name}.main")
+                if not hasattr(main_mod, "run"):
+                    raise AttributeError(
+                        f"{pkg_name}.main must define `run(ctx)` — got module "
+                        f"with attrs: {sorted(vars(main_mod).keys())[:20]}"
+                    )
+                result = main_mod.run(self._exec_globals)
+        except BaseException:  # defensive; propagate minimal info
+            ok = False
+            traceback.print_exc(file=tee_err)
+        finally:
+            if path_was_added and parent in sys.path:
+                sys.path.remove(parent)
+
+        return {
+            "ok": ok,
+            "stdout": stdout_buffer.getvalue(),
+            "stderr": stderr_buffer.getvalue(),
+            "result": result if result is not None else self._exec_globals.get("RESULT"),
+        }
+
+    def _exec(self, code_or_path: str | Path) -> dict[str, Any]:
+        """Dispatch user code: string-mode (unchanged) or package-mode (new).
+
+        - :class:`pathlib.Path` inputs are treated as package directories.
+        - ``str`` inputs that point at an existing directory on disk are
+          treated as package directories (path form as string).
+        - All other ``str`` inputs are treated as Python source code and run
+          via the unchanged :meth:`_exec_user_code` path.
+        """
+        if isinstance(code_or_path, Path) or (
+            isinstance(code_or_path, str) and os.path.isdir(code_or_path)
+        ):
+            return self._exec_user_package(Path(code_or_path))
+        return self._exec_user_code(code_or_path)
+
     def _init_exec_globals(self) -> None:
         """
         Initialize the persistent globals dictionary for user code execution.
@@ -260,13 +412,19 @@ class CodeExecutionEnvBase(Env):
         info.update({"task_prompt": self._task_prompt})
         return obs, info
 
-    def step(self, action: str) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
+    def step(
+        self, action: str | Path
+    ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
         """
         Default implementation: execute code with helpers, report reward and logs.
+        ``action`` is normally a code string; if it is a :class:`~pathlib.Path`
+        (or a string that happens to point at an existing directory) it is
+        treated as a Python package directory and dispatched to the
+        package-mode executor instead.
         Subclasses can override hooks to customize inputs and helper bindings.
         """
         self._step_count += 1
-        exec_result = self._exec_user_code(action)
+        exec_result = self._exec(action)
         obs = self._get_observation()
         # Force viser 3D view update after code execution so the scene
         # reflects the final state (sim substep updates may have been skipped).
