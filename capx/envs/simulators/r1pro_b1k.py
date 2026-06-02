@@ -8,11 +8,14 @@ hot-swappable for code execution environments.
 from __future__ import annotations
 
 import os
+import logging
 from typing import Any, Tuple, List
 import numpy as np
 from collections import deque
 
 from capx.envs.base import BaseEnv
+
+logger = logging.getLogger(__name__)
 # from base_env import BaseEnv
 
 import sys
@@ -374,7 +377,7 @@ class R1ProBehaviourLowLevel(BaseEnv):
             try:
                 metric.reset(self.env)
             except Exception as _e:
-                print(f"[metric.reset skipped] {type(metric).__name__}: {_e}")
+                logger.warning("[metric.reset skipped] %s: %s", type(metric).__name__, _e)
             
         self.step_num = 0
         
@@ -407,7 +410,7 @@ class R1ProBehaviourLowLevel(BaseEnv):
             try:
                 metric.step(self.env, action, obs, reward, terminated, truncated, info)
             except Exception as _e:
-                print(f"[metric.step skipped] {type(metric).__name__}: {_e}")
+                logger.warning("[metric.step skipped] %s: %s", type(metric).__name__, _e)
         return obs, reward, terminated, truncated, info
     
     
@@ -467,7 +470,7 @@ class R1ProBehaviourLowLevel(BaseEnv):
             try:
                 metrics.update(metric.aggregate(self.env))
             except Exception as _e:
-                print(f"[metric.aggregate skipped] {type(metric).__name__}: {_e}")
+                logger.warning("[metric.aggregate skipped] %s: %s", type(metric).__name__, _e)
             
         if self.task_completed():
             return 1

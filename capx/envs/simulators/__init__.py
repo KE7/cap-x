@@ -1,5 +1,9 @@
 # import all environments here to register them!
+import logging
+
 from capx.envs.base import list_envs, register_env
+
+logger = logging.getLogger(__name__)
 
 
 try:
@@ -9,7 +13,7 @@ except Exception:
     # franka_real (real-robot teleop) needs viser; not required for BEHAVIOR/sim
     # eval. Guard the import so an unrelated viser/websockets issue doesn't block
     # registration of the other (BEHAVIOR) environments.
-    print("Franka real (viser) not available!")
+    logger.warning("Franka real (viser) not available!")
 
 # NOTE: Can only have one of Robosuite or LIBERO installed at a time!
 # Using Robosuite run: uv sync --extra robosuite
