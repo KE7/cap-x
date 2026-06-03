@@ -495,15 +495,18 @@ BEHAVIOR runs from the b1k venv against the **source-built** aarch64 Isaac Sim 5
 confirm per box). The **PYTHONPATH shims are mandatory**: prepend the venv's
 `websockets` and `typing_extensions` so they win over Isaac's older bundled copies
 (Isaac's prebundled `typing_extensions` lacks `Sentinel`; without the prepend,
-imports break).
+imports break). The committed `scripts/setup_behavior_shims.sh` materializes the two
+shim dirs from the b1k venv and exports `WS_SHIM` + `TE_SHIM` (sourced AFTER Isaac's
+`setup_python_env.sh` so the venv copies win) — it replaces the old hand-made
+`/tmp/ws_shim` + `/tmp/te_shim` symlinks.
 
 ```bash
 export ISAAC_PATH=/path/to/isaacsim/_build/linux-aarch64/release
 export CARB_APP_PATH="$ISAAC_PATH/kit"
 export EXP_PATH="$ISAAC_PATH/apps"
 source "$ISAAC_PATH/setup_python_env.sh"        # sets PYTHONPATH + LD_LIBRARY_PATH
-# shims FIRST so the venv copies win over Isaac's bundled ones:
-export PYTHONPATH="$WS_SHIM:$TE_SHIM:$PYTHONPATH"   # WS_SHIM=venv websockets, TE_SHIM=venv typing_extensions
+# shims FIRST so the venv copies win over Isaac's bundled ones (run from repo root):
+source scripts/setup_behavior_shims.sh          # sets WS_SHIM/TE_SHIM, prepends both to PYTHONPATH
 export LD_PRELOAD="/lib/aarch64-linux-gnu/libgomp.so.1:$ISAAC_PATH/kit/libcarb.so"  # libgomp = aarch64 quirk
 export OMNI_KIT_ACCEPT_EULA=YES OMNIGIBSON_HEADLESS=1 CUDA_HOME=/usr/local/cuda
 ```
