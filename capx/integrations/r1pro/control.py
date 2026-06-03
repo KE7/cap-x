@@ -1108,14 +1108,34 @@ class R1ProControlApi(ApiBase):
         
         try:
             current_q = self.get_current_joint_positions()[6:24][self.controller_joint_mapping]
-            cfg = self._pks.solve_ik_rest(
-                robot=self._robot,
-                target_link_name=target_link_name,
-                target_position=offset_pos,
-                target_wxyz=quat_wxyz,
-                rest_cost_weights=self._rest_cost_weights,
-                initial_q=current_q,
-            )
+            if os.environ.get("CAPX_PYROKI_REMOTE_IK"):
+                # Route IK to the GPU pyroki server (.venv-pyroki, jax CUDA) instead of
+                # the in-process CPU jaxls solve (b1k venv jax 0.4.29 CPU-only), which
+                # wedged the prior M3 run. Same solve_ik_rest algorithm, on GPU.
+                import requests as _requests
+                _url = os.environ.get("CAPX_PYROKI_SERVER_URL", "http://127.0.0.1:8116")
+                _resp = _requests.post(
+                    f"{_url.rstrip('/')}/ik_rest",
+                    json={
+                        "target_link_name": target_link_name,
+                        "target_position": np.asarray(offset_pos, dtype=np.float64).reshape(3).tolist(),
+                        "target_wxyz": np.asarray(quat_wxyz, dtype=np.float64).reshape(4).tolist(),
+                        "rest_cost_weights": np.asarray(self._rest_cost_weights, dtype=np.float64).reshape(-1).tolist(),
+                        "initial_q": np.asarray(current_q, dtype=np.float64).reshape(-1).tolist(),
+                    },
+                    timeout=60.0,
+                )
+                _resp.raise_for_status()
+                cfg = np.asarray(_resp.json()["cfg"], dtype=np.float64)
+            else:
+                cfg = self._pks.solve_ik_rest(
+                    robot=self._robot,
+                    target_link_name=target_link_name,
+                    target_position=offset_pos,
+                    target_wxyz=quat_wxyz,
+                    rest_cost_weights=self._rest_cost_weights,
+                    initial_q=current_q,
+                )
         except TimeoutError:
             raise  # don't swallow SIGALRM timeout
         except Exception as e:
