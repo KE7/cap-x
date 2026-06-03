@@ -447,7 +447,8 @@ Pre-launch SAM3 + ContactGraspNet (these two only — let the YAML reuse them by
 ```bash
 # SAM3 needs the decord stub on PYTHONPATH on aarch64 (no aarch64 decord wheel —
 # env-specific shim, NOT needed on a clean x86 install); see §8 + perception notes.
-PYTHONPATH=/path/to/sam3_stubs \
+# The stub ships in-repo at scripts/aarch64_stubs/ (run from the repo root):
+PYTHONPATH=scripts/aarch64_stubs \
   .venv-libero/bin/python -m capx.serving.launch_sam3_server            --device cuda --port 8114 --host 127.0.0.1
 .venv-libero/bin/python -m capx.serving.launch_contact_graspnet_server --device cuda --port 8115 --host 127.0.0.1
 ```
