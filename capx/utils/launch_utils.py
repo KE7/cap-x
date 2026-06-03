@@ -45,7 +45,19 @@ from capx.llm.client import (  # noqa: F401
 if TYPE_CHECKING:
     from capx.envs.launch import LaunchArgs
 
-multiprocessing.set_start_method("spawn", force=True)
+import platform as _platform
+
+# Isaac Sim's import-time aarch_preload_checking() (isaacsim/__init__.py) starts a
+# multiprocessing.Process on the GLOBAL start method. On aarch64 (DGX Spark / GB10),
+# forcing "spawn" makes that child re-import isaacsim during bootstrap, which re-enters
+# aarch_preload_checking() -> process.start() *inside* the spawn bootstrap phase and
+# raises RuntimeError("...Safe importing of main module..."). "fork" lets the child
+# inherit the already-imported isaacsim (no re-import, no recursion). Trial-pool and
+# CUDA server procs that genuinely need spawn request it explicitly via
+# get_context("spawn"), so they are unaffected by this default.
+_MP_MACHINE = _platform.machine().lower()
+_MP_START_METHOD = "fork" if ("arm" in _MP_MACHINE or "aarch" in _MP_MACHINE) else "spawn"
+multiprocessing.set_start_method(_MP_START_METHOD, force=True)
 
 
 @dataclass

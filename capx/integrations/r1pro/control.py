@@ -490,7 +490,7 @@ class R1ProControlApi(ApiBase):
 
     def get_object_pose(
         self, object_name: str, return_bbox_extent: bool = False
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, np.ndarray, o3d.geometry.OrientedBoundingBox]:
         """Get the pose of an object in the environment from a natural language description and current camera view.
         If the object is not found, return None for all return values.
 
@@ -1400,8 +1400,10 @@ class R1ProControlApi(ApiBase):
         all_keys = list(obs.keys())
         robot_key = [key for key in all_keys if 'robot' in key][0]
         ego_camera = self._env.robot.sensors[f'{robot_key}:zed_link:Camera:0']
-        side_camera = self._env.robot.sensors[f'{robot_key}:left_realsense_link:Camera:0']
-        side_intrinsic_matrix = side_camera.intrinsic_matrix
+        # NOTE: removed a dead read of the left_realsense_link intrinsic_matrix — it
+        # was never used (only the ego/ZED intrinsics are returned) and it crashed in
+        # headless OmniGibson 3.8.0 / Isaac 5.1 because the wrist camera's camera_params
+        # annotator is degenerate at that point (renderProductResolution == [0, 0]).
         ego_intrinsic_matrix = ego_camera.intrinsic_matrix
         return ego_intrinsic_matrix.detach().numpy()
     

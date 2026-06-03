@@ -655,7 +655,11 @@ def _run_single_trial(
     import signal
     remaining = signal.alarm(0)  # cancel current alarm
     if remaining > 0:
-        signal.alarm(1000)  # restart fresh 1000s from now
+        # Re-arm with the remaining runner budget instead of a hardcoded 1000s, so the
+        # runner's configured trial timeout (runner.TRIAL_TIMEOUT_SECONDS) actually governs
+        # task execution. The old hardcoded 1000s masked the runner's configured timeout and
+        # could kill a slow grasp+lift mid-execution on aarch64/GB10. Reversible.
+        signal.alarm(remaining)
     obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
     _patch_libero_goal(env, obs)
 

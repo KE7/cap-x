@@ -1,18 +1,21 @@
-"""Low-level Robosuite Franka environment compatible with FrankaControlApi.
+"""Low-level R1Pro BEHAVIOR-1K environment compatible with FrankaControlApi.
 
-This module provides a thin wrapper around Robosuite's Stack environment
-that implements the same interface as FrankaPickPlaceLowLevel, making it
-hot-swappable for code execution environments.
+This module provides a thin wrapper around OmniGibson's BEHAVIOR-1K R1Pro
+task environment (R1ProBehaviourLowLevel) that implements the same low-level
+control interface, making it hot-swappable for code execution environments.
 """
 
 from __future__ import annotations
 
 import os
+import logging
 from typing import Any, Tuple, List
 import numpy as np
 from collections import deque
 
 from capx.envs.base import BaseEnv
+
+logger = logging.getLogger(__name__)
 # from base_env import BaseEnv
 
 import sys
@@ -109,8 +112,33 @@ def get_grasp_poses_for_object_sticky(target_obj, object_obb):
     return grasp_poses
 
 
+def build_motion_generator(
+    env,
+    robot,
+    batch_size: int = 3,
+    enable_head_tracking: bool = False,
+):
+    """Build a StarterSemanticActionPrimitives controller backed by the native
+    StanfordVL cuRobo motion generator.
+
+    Args:
+        env (Environment): the OmniGibson environment.
+        robot (BaseRobot): the robot to plan for.
+        batch_size (int): cuRobo planning batch size.
+        enable_head_tracking (bool): forwarded to the controller.
+
+    Returns:
+        StarterSemanticActionPrimitives: the controller, which constructs and
+        uses the native cuRobo ``CuRoboMotionGenerator`` itself (including the
+        sm_12x embodiment guard in ``action_primitives/curobo``).
+    """
+    return StarterSemanticActionPrimitives(
+        env, robot, enable_head_tracking=enable_head_tracking, curobo_batch_size=batch_size
+    )
+
+
 class R1ProBehaviourLowLevel(BaseEnv):
-    """ 
+    """
     Behavior-1K low-level environment.
     """
 
@@ -125,15 +153,38 @@ class R1ProBehaviourLowLevel(BaseEnv):
         super().__init__()
         config_filename =  os.path.join(og.example_config_path, controller_cfg)
         self.controller_cfg = yaml.load(open(config_filename, "r"), Loader=yaml.FullLoader)
+        # og.Environment() mutates the config in place, renaming the deprecated robot 'type' key
+        # to lowercase 'model' (e.g. 'r1pro'). The presampled robot_poses in the tro_state files are
+        # keyed by the capitalized robot class name (e.g. 'R1Pro'), so capture the original 'type'
+        # string now, before env construction rewrites it. (OG 3.8.0 dropped robot.model_name.)
+        self._robot_type_name = self.controller_cfg["robots"][0]["type"]
+        # aarch64 (DGX Spark / GB10): Isaac's omni.replicator.core OgnInstanceSegmentation::compute
+        # segfaults during the synthetic-data render (known aarch64 Isaac bug). The scored
+        # trial perception path uses SAM3 on RGB
+        # (privileged=false); the sim's seg_* modality is only consumed by the __main__ demo, so we
+        # drop seg_* modalities on aarch64 to avoid the crash while keeping rgb/depth/proprio.
+        import platform as _platform
+        if "aarch" in _platform.machine().lower() or "arm" in _platform.machine().lower():
+            _robot_cfgs = self.controller_cfg.get("robots", [])
+            for _rc in _robot_cfgs:
+                _mods = _rc.get("obs_modalities")
+                if isinstance(_mods, list):
+                    _rc["obs_modalities"] = [m for m in _mods if not str(m).startswith("seg")]
         if activity_name is not None:
             self.controller_cfg['task']['activity_name'] = activity_name
             # Load all rooms so any task can find its required objects
             self.controller_cfg['scene']['load_room_types'] = None
         self.task_name = self.controller_cfg['task']['activity_name']
-        
+
         self._step_count = 0
         self._sim_step_count = 0
-        
+        # Render-on-read optimization: internal physics steps
+        # (settle/move/gripper loops, whose obs is discarded) run physics-only; the per-step
+        # GPU render (~60% of step time) is skipped, and get_observation() renders explicitly
+        # so frames the model/eval consume stay IDENTICAL. Reversible: set True to restore
+        # per-step rendering.
+        self._render_steps = False
+
         self.cur_observation = None
         self.observation_buffer = deque(maxlen=10)
         
@@ -168,7 +219,9 @@ class R1ProBehaviourLowLevel(BaseEnv):
         self.metrics = self.load_metrics()
         
         
-        self.controller = StarterSemanticActionPrimitives(self.env, self.env.robots[0], enable_head_tracking=False)
+        self.controller = build_motion_generator(
+            self.env, self.env.robots[0], enable_head_tracking=False
+        )
         # torso_joint = self.controller.robot.joints["torso_joint2"]
         self.torso_idx_map = {
             "torso_joint1": 6,
@@ -221,8 +274,16 @@ class R1ProBehaviourLowLevel(BaseEnv):
                 f"{tro_filename}-tro_state.json",
             )
         else:
+            # OmniGibson 3.8.0 changed get_task_instance_path() to (scene_name, instance_name)
+            # returning a single instance JSON path, not the scene base dir cap-x appends to.
+            # The 2025-challenge tro_state files live under <DATA_PATH>/2025-challenge-task-instances/
+            # scenes/<scene_model>/json/<scene_model>_task_<activity>_instances/<tro_filename>-tro_state.json,
+            # so reconstruct the scene base dir directly (matches the on-disk layout).
             tro_file_path = os.path.join(
-                get_task_instance_path(scene_model),
+                gm.DATA_PATH,
+                "2025-challenge-task-instances",
+                "scenes",
+                scene_model,
                 f"json/{scene_model}_task_{self.env.task.activity_name}_instances/{tro_filename}-tro_state.json",
             )
             
@@ -231,8 +292,8 @@ class R1ProBehaviourLowLevel(BaseEnv):
         for tro_key, tro_state in tro_state.items():
             if tro_key == "robot_poses":
                 presampled_robot_poses = tro_state
-                robot_pos = presampled_robot_poses[self.robot.model_name][0]["position"]
-                robot_quat = presampled_robot_poses[self.robot.model_name][0]["orientation"]
+                robot_pos = presampled_robot_poses[self._robot_type_name][0]["position"]
+                robot_quat = presampled_robot_poses[self._robot_type_name][0]["orientation"]
                 self.robot.set_position_orientation(robot_pos, robot_quat)
                 # Write robot poses to scene metadata
                 self.env.scene.write_task_metadata(key=tro_key, data=tro_state)
@@ -245,7 +306,11 @@ class R1ProBehaviourLowLevel(BaseEnv):
         for _ in range(25):
             og.sim.step_physics()
             for entity in self.env.task.object_scope.values():
-                if not entity.is_system and entity.exists:
+                # OG 3.8.0 dropped the `is_system` attribute on some entities (e.g. Robot). Skip
+                # systems defensively and only settle entities that exist and support keep_still().
+                if getattr(entity, "is_system", False):
+                    continue
+                if getattr(entity, "exists", True) and hasattr(entity, "keep_still"):
                     entity.keep_still()
 
         self.env.scene.update_initial_file()
@@ -304,7 +369,15 @@ class R1ProBehaviourLowLevel(BaseEnv):
             self.load_task_instance(0)
             
         for metric in self.metrics:
-            metric.start_callback(self.env)
+            # OG 3.8.0 metric API: start_callback -> reset(env). Guard defensively: OmniGibson
+            # 3.8.0's TaskMetric.reset evaluates BDDL goal predicates whose API drifted in this b1k
+            # branch (HEAD.evaluate() now needs evaluate_fn) and raises. These metrics are auxiliary
+            # (human-stat distance); the radio reward/success is computed by pick_up_radio_reward(),
+            # so skip any metric that fails rather than aborting the trial.
+            try:
+                metric.reset(self.env)
+            except Exception as _e:
+                logger.warning("[metric.reset skipped] %s: %s", type(metric).__name__, _e)
             
         self.step_num = 0
         
@@ -314,13 +387,17 @@ class R1ProBehaviourLowLevel(BaseEnv):
         """Low-level step - not typically called directly in code execution mode."""
         self._step_count += 1
         # This is a fallback; normally FrankaControlApi methods are used
-        obs, reward, terminated, truncated, info = self.env.step(action)
+        # Internal stepping is physics-only (render skipped) unless _render_steps is True;
+        # the returned obs here is discarded by all callers — the model reads frames via
+        # get_observation()/render()/reset(), which render explicitly.
+        with og.sim.render_on_step(self._render_steps):
+            obs, reward, terminated, truncated, info = self.env.step(action)
         # self.observation_buffer.append(obs)
         self.cur_observation = obs
         success = info['done']['success']
         obs_keys = list(obs.keys())
         robot_key = [key for key in obs_keys if 'robot' in key][0]
-        if self.save_video:
+        if self.save_video and self._render_steps:
             self.obs_buffer['robot']['ego'].append(obs[f'{robot_key}'][f'{robot_key}:zed_link:Camera:0']['rgb'][:,:,:3])
             self.obs_buffer['robot']['left_wrist'].append(obs[f'{robot_key}'][f'{robot_key}:left_realsense_link:Camera:0']['rgb'][:,:,:3])
             self.obs_buffer['robot']['right_wrist'].append(obs[f'{robot_key}'][f'{robot_key}:right_realsense_link:Camera:0']['rgb'][:,:,:3])
@@ -329,7 +406,11 @@ class R1ProBehaviourLowLevel(BaseEnv):
         self._record_frame()
         
         for metric in self.metrics:
-            metric.step_callback(self.env)
+            # OG 3.8.0 metric API: step_callback -> step(...). Guard defensively (see reset()).
+            try:
+                metric.step(self.env, action, obs, reward, terminated, truncated, info)
+            except Exception as _e:
+                logger.warning("[metric.step skipped] %s: %s", type(metric).__name__, _e)
         return obs, reward, terminated, truncated, info
     
     
@@ -383,11 +464,13 @@ class R1ProBehaviourLowLevel(BaseEnv):
         if 'trash' in self.task_name:
             return self.pick_up_trash_reward()
 
-        for metric in self.metrics:
-            metric.end_callback(self.env)
+        # OG 3.8.0 metric API: end_callback + gather_results -> aggregate(env). Guard defensively.
         metrics = {}
         for metric in self.metrics:
-            metrics.update(metric.gather_results())
+            try:
+                metrics.update(metric.aggregate(self.env))
+            except Exception as _e:
+                logger.warning("[metric.aggregate skipped] %s: %s", type(metric).__name__, _e)
             
         if self.task_completed():
             return 1
@@ -433,9 +516,13 @@ class R1ProBehaviourLowLevel(BaseEnv):
                     - proprio: 68
 
         """
+        # Render-on-read: internal steps skip rendering, so refresh the camera render
+        # products here before reading cached annotators, guaranteeing a CURRENT frame
+        # identical to the old per-step render.
+        og.sim.render()
         obs, info = self.env.get_obs()
         return obs
-    
+
     
     def update_torso(self, torso_joint_name: str, angle: float, max_steps=50):
         torso_joint = self.controller.robot.joints[torso_joint_name]
@@ -1086,7 +1173,8 @@ def get_navigation_pose(P_table, P_radio):
     else:
         outward = n2
         
-    buffer_distance = 0.3
+    buffer_distance = 0.3   # upstream canonical standoff (capgym/cap-x, Max Fu 823fcc5,
+                            # ancestor of upstream/main 53e9966)
     base_xy = p_edge_xy + outward * buffer_distance
     
     dx, dy = radio_xy - base_xy
@@ -1185,7 +1273,15 @@ if __name__ == "__main__":
         P_radio  = backproject_depth(np.array(radio_mask), np.array(ego_depth), np.array(intrinsic_matrix), T_world_cam)   # (Nr, 3)
         
         goal = get_navigation_pose(P_table, P_radio)
-        env._navigate_to_pose(goal)
+        # Validate the computed standoff goal against the live BASE collision world: with the
+        # full-body BASE collision check now ON (b1k PR#4), _navigate_to_pose plans WITH obstacles
+        # and returns False if cuRobo refuses the goal (e.g. the perceived table hull under-covers
+        # the support furniture and the standoff still lands the footprint in collision). On
+        # failure, fall back to the validated sampler, which samples collision-free base poses
+        # around the object (BASE embodiment, obstacles active) via _sample_pose_near_object.
+        nav_ok = env._navigate_to_pose(goal)
+        if not nav_ok:
+            env._navigate_to_obj("radio_89")
         
         robot_pos, robot_quat = env.robot.get_position_orientation()
         grasp_obj = env.env.scene.object_registry("name", "radio_89")

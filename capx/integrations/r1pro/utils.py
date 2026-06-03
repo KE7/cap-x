@@ -233,7 +233,8 @@ def get_navigation_pose(P_table, P_radio):
     else:
         outward = n2
         
-    buffer_distance = 0.3
+    buffer_distance = 0.3   # upstream canonical standoff (capgym/cap-x, Max Fu 823fcc5,
+                            # ancestor of upstream/main 53e9966)
     base_xy = p_edge_xy + outward * buffer_distance
     
     dx, dy = radio_xy - base_xy

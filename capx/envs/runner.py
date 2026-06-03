@@ -36,7 +36,12 @@ from capx.utils.parallel_eval import run_parallel_with_setup
 # Constants
 # ---------------------------------------------------------------------------
 
-TRIAL_TIMEOUT_SECONDS = 1000
+# Per-trial wall-clock cap (SIGALRM), covering LLM generation + Isaac/curobo execution.
+# Raised from the previous 1000s: the generated grasp/settle code that steps Isaac
+# physics could blow the old cap mid-execution (e.g. _settle_robot -> get_transforms),
+# producing a 0.000 timeout artifact instead of a real score. 7200s (2h) gives Isaac
+# ample room to finish a trial while still bounding a genuine hang. Reversible.
+TRIAL_TIMEOUT_SECONDS = 7200
 MAX_TRIAL_RETRIES = 3
 
 
