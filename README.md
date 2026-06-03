@@ -33,7 +33,9 @@ Shankar Sastry<sup>2</sup>, Yuke Zhu<sup>1</sup>, Ken Goldberg<sup>&dagger;,2</s
 
 ## Installation
 
-CaP-X uses [uv](https://docs.astral.sh/uv/) for dependency management. Requires **Python 3.10** and a **CUDA-capable GPU**.
+CaP-X uses [uv](https://docs.astral.sh/uv/) for dependency management. For the x86_64 path, it requires **Python 3.10** and a **CUDA-capable GPU**. (aarch64 / DGX Spark uses Python 3.11 + CUDA 13 — see the [Spark guide](docs/spark-aarch64-setup.md).)
+
+> **On aarch64 / NVIDIA DGX Spark (GB10, CUDA 13)?** The instructions below are for x86_64. Follow [docs/spark-aarch64-setup.md](docs/spark-aarch64-setup.md) instead — it has the cu130 torch recipe, per-venv setup scripts, and the curobo/open3d/decord workarounds for ARM.
 
 ```bash
 git clone --recurse-submodules https://github.com/capgym/cap-x && cd cap-x
@@ -74,7 +76,7 @@ See [docs/libero-tasks.md](docs/libero-tasks.md) for running any of 130+ LIBERO 
 
 #### BEHAVIOR (Isaac Sim)
 
-BEHAVIOR tasks run on NVIDIA Isaac Sim via OmniGibson. Requires Python 3.10 and CUDA 12.x.
+BEHAVIOR tasks run on NVIDIA Isaac Sim via OmniGibson. On the x86_64 / Isaac 4.5 path this requires Python 3.10 and CUDA 12.x; aarch64 / GB10 uses Isaac 5.1 (Python 3.11) per the [Spark guide](docs/spark-aarch64-setup.md).
 
 ```bash
 cd capx/third_party/b1k

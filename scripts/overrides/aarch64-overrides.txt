@@ -1,0 +1,33 @@
+# aarch64 / DGX Spark (GB10, CUDA 13) dependency overrides for cap-x venvs.
+#
+# Passed to `uv pip install --overrides scripts/overrides/aarch64-overrides.txt ...`
+# by scripts/setup_robosuite_venv.sh and scripts/setup_libero_venv.sh.
+#
+# WHY THIS FILE EXISTS:
+#   `uv pip install` does NOT auto-apply the `[tool.uv] override-dependencies`
+#   block in pyproject.toml (that only applies to `uv sync`/`uv lock`). On this
+#   box `uv sync` is blocked anyway because `[tool.uv] environments` is pinned to
+#   x86_64 only. So we replicate the pyproject overrides here, PLUS the two
+#   aarch64-specific pins that make the closure resolve without source builds.
+#
+# Keep the first block in sync with pyproject.toml [tool.uv] override-dependencies.
+
+# --- mirror of pyproject.toml [tool.uv] override-dependencies ---
+transformers<5.0
+PyOpenGL==3.1.6
+PyOpenGL-accelerate==3.1.6
+numpy==1.26.4
+opencv-python-headless<4.13
+opencv-python ; sys_platform == 'never'
+jax<0.4.30
+jaxlib<0.4.30
+
+# --- aarch64 / Spark specific ---
+# open3d: only 0.18.0 ships an aarch64 linux wheel covering cp311 (cp38-cp311).
+# 0.19.0 has NO aarch64 wheel; there is NO cp312 wheel at any version -> venvs
+# must be Python 3.11 to keep open3d without a source build.
+open3d==0.18.0
+# decord: NO aarch64 wheel at any version/python. Gate it out (sam3-train-only).
+# Restore via a CPU source build if sam3 training/video is needed in this venv
+# (see docs/spark-aarch64-setup.md "decord source build").
+decord ; sys_platform == 'never'
