@@ -1,6 +1,8 @@
 import base64
 import io
 import logging
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -17,40 +19,46 @@ from transformers import (
     OwlViTProcessor,
 )
 
-# Configure logging
+from capx.serving.drain_batcher import DrainBatcher
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-
-# Global state
 _PROC: Any | None = None
 _MODEL: Any | None = None
-_DEVICE: str = "cuda"
-_THRESHOLD: float = 0.05
+_DEVICE = "cuda"
+_THRESHOLD = 0.05
+_BATCHER: DrainBatcher[Any, Any] | None = None
 
 
-# --- Helper Functions ---
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    global _BATCHER
+    _BATCHER = DrainBatcher(_do_detect_batch, name="owlvit")
+    await _BATCHER.start()
+    try:
+        yield
+    finally:
+        await _BATCHER.close()
+        _BATCHER = None
+
+
+app = FastAPI(lifespan=_lifespan)
 
 
 def _encode_image(image: np.ndarray | Image.Image) -> str:
-    if isinstance(image, np.ndarray):
-        image_u8 = np.clip(image, 0, 255).astype(np.uint8) if image.dtype != np.uint8 else image
-        pil_image = Image.fromarray(image_u8).convert("RGB")
-    else:
-        pil_image = image
-
+    pil_image = (
+        Image.fromarray(np.clip(image, 0, 255).astype(np.uint8)).convert("RGB")
+        if isinstance(image, np.ndarray)
+        else image
+    )
     buffered = io.BytesIO()
     pil_image.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
 def _decode_image(image_base64: str) -> Image.Image:
-    image_bytes = base64.b64decode(image_base64)
-    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-
-# --- API Models ---
+    return Image.open(io.BytesIO(base64.b64decode(image_base64))).convert("RGB")
 
 
 class DetectRequest(BaseModel):
@@ -69,57 +77,66 @@ class DetectResponse(BaseModel):
     detections: list[Detection]
 
 
-# --- API Endpoints ---
+@dataclass
+class _DetectWork:
+    image: Image.Image
+    texts: list[str]
+    threshold: float
+
+
+def _do_detect_batch(works: list[_DetectWork]) -> list[DetectResponse]:
+    """Perform one OWL-ViT forward pass and post-process each HTTP request."""
+    assert _MODEL is not None and _PROC is not None
+    images = [np.asarray(work.image, dtype=np.uint8) for work in works]
+    inputs = _PROC(text=[work.texts for work in works], images=images, return_tensors="pt")
+    with torch.no_grad():
+        outputs = _MODEL(**{key: value.to(_MODEL.device) for key, value in inputs.items()})
+    target_sizes = torch.tensor([image.shape[:2] for image in images], device=_MODEL.device)
+    # Post-process at the most permissive request threshold, then apply each
+    # request's threshold independently so the response contract stays exact.
+    results = _PROC.post_process_grounded_object_detection(
+        outputs, threshold=0.0, target_sizes=target_sizes
+    )
+    responses: list[DetectResponse] = []
+    for work, result in zip(works, results, strict=True):
+        detections = [
+            Detection(
+                label=work.texts[int(label)],
+                score=float(score.item()),
+                box=[round(value, 2) for value in box.detach().cpu().numpy().tolist()],
+            )
+            for box, score, label in zip(
+                result["boxes"], result["scores"], result["labels"], strict=True
+            )
+            if float(score.item()) >= work.threshold
+        ]
+        responses.append(DetectResponse(detections=detections))
+    return responses
 
 
 @app.post("/detect", response_model=DetectResponse)
 async def detect_endpoint(req: DetectRequest):
-    if _MODEL is None or _PROC is None:
+    if _MODEL is None or _PROC is None or _BATCHER is None:
         raise HTTPException(status_code=503, detail="Model not initialized")
-
     try:
-        # Decode image
-        pil_image = _decode_image(req.image_base64)
-        rgb = np.array(pil_image)
-
-        # Use request threshold or default
-        threshold = req.threshold if req.threshold is not None else _THRESHOLD
         texts = req.texts if req.texts is not None else [["an object"]]
-
-        # Process
-        rgb_u8 = np.clip(rgb, 0, 255).astype(np.uint8) if rgb.dtype != np.uint8 else rgb
-        inputs = _PROC(text=texts, images=rgb_u8, return_tensors="pt")
-        with torch.no_grad():
-            outputs = _MODEL(**{k: v.to(_MODEL.device) for k, v in inputs.items()})
-
-        target_sizes = torch.tensor([rgb_u8.shape[:2]], device=_MODEL.device)
-        results = _PROC.post_process_grounded_object_detection(
-            outputs=outputs, threshold=threshold, target_sizes=target_sizes
-        )
-
-        detections = []
-        i = 0
-        labels = texts[i]
-        for box, score, label in zip(
-            results[i]["boxes"], results[i]["scores"], results[i]["labels"], strict=False
-        ):
-            b = box.detach().to("cpu").numpy().tolist()
-            detections.append(
-                Detection(
-                    label=labels[int(label)],
-                    score=float(score.item()),
-                    box=[round(x, 2) for x in b],
-                )
+        if len(texts) != 1:
+            raise HTTPException(
+                status_code=400, detail="texts must contain one label list per image request"
             )
-
-        return DetectResponse(detections=detections)
-
-    except Exception as e:
-        logger.error(f"Error during detection: {e}")
-        raise HTTPException(status_code=500, detail=f"Detection failed: {str(e)}")
-
-
-# --- Entrypoint ---
+        return await _BATCHER.submit(
+            "detect",
+            _DetectWork(
+                _decode_image(req.image_base64),
+                texts[0],
+                req.threshold if req.threshold is not None else _THRESHOLD,
+            ),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Error during detection: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Detection failed: {exc}") from exc
 
 
 def main(
@@ -130,32 +147,21 @@ def main(
     threshold: float = 0.05,
 ):
     global _PROC, _MODEL, _DEVICE, _THRESHOLD
-
-    _DEVICE = device
-    _THRESHOLD = threshold
-
-    logger.info(f"Loading OWL-ViT model: {model_name} on {device}...")
-
-    # Determine if this is OWL-v2 or OWL-ViT based on model name
-    is_v2 = "owlv2" in model_name.lower()
-
-    try:
-        if is_v2:
-            _PROC = Owlv2Processor.from_pretrained(model_name)
-            _MODEL = Owlv2ForObjectDetection.from_pretrained(model_name)
-        else:
-            _PROC = OwlViTProcessor.from_pretrained(model_name)
-            _MODEL = OwlViTForObjectDetection.from_pretrained(model_name)
-
-        _MODEL = _MODEL.to(device)
-        _MODEL.eval()
-
-        logger.info(f"OWL-ViT model loaded on {device}. Starting server...")
-        uvicorn.run(app, host=host, port=port)
-
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        raise
+    _DEVICE, _THRESHOLD = device, threshold
+    logger.info("Loading OWL-ViT model: %s on %s...", model_name, device)
+    if "owlv2" in model_name.lower():
+        _PROC, _MODEL = (
+            Owlv2Processor.from_pretrained(model_name),
+            Owlv2ForObjectDetection.from_pretrained(model_name),
+        )
+    else:
+        _PROC, _MODEL = (
+            OwlViTProcessor.from_pretrained(model_name),
+            OwlViTForObjectDetection.from_pretrained(model_name),
+        )
+    _MODEL = _MODEL.to(device)
+    _MODEL.eval()
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
