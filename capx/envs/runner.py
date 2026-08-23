@@ -152,6 +152,20 @@ EVALUATION_SERVICE_REQUIRED_ROUTES: dict[str, tuple[str, ...]] = {
     "capx.serving.launch_owlvit_server.main": ("/detect",),
 }
 
+#: Request-schema properties that identify a service when its ROUTES do not.
+#:
+#: SAM2 and SAM3 expose exactly the same two paths ("/segment",
+#: "/segment_point") and set no FastAPI title, so a route check alone would
+#: adopt a resident SAM2 as SAM3 and report "identity verified" -- silently
+#: swapping the segmentation model under every scored trial.  Their request
+#: bodies differ, and that difference is visible in the same /openapi.json:
+#: SAM3's SegmentRequest carries ``text_prompt`` (it is text-prompted), SAM2's
+#: carries ``box``/``max_masks``.  Checked as {schema_name: (property, ...)}.
+EVALUATION_SERVICE_REQUIRED_SCHEMA: dict[str, dict[str, tuple[str, ...]]] = {
+    "capx.serving.launch_sam3_server.main": {"SegmentRequest": ("text_prompt",)},
+    "capx.serving.launch_sam2_server.main": {"SegmentRequest": ("box",)},
+}
+
 #: Ports an evaluation service may never be allocated, and who owns them.
 RESERVED_EVALUATION_PORTS: dict[int, str] = {
     8122: "Molmo vLLM (hard-coded in capx/integrations/vision/molmo.py)",
@@ -244,18 +258,34 @@ def _evaluation_service_required_routes(api_server: dict) -> tuple[str, ...]:
         ) from None
 
 
-def _fetch_openapi_paths(host: str, port: int, timeout: float) -> set[str] | None:
-    """Route set advertised by the server on ``host:port``, or None if unreadable."""
+def _fetch_openapi_document(host: str, port: int, timeout: float) -> dict | None:
+    """The server's OpenAPI document, or None if unreadable."""
     url = f"http://{host}:{int(port)}/openapi.json"
     try:
         with urllib.request.urlopen(url, timeout=timeout) as response:
             document = json.loads(response.read().decode("utf-8"))
     except Exception:
         return None
-    paths = document.get("paths") if isinstance(document, dict) else None
+    return document if isinstance(document, dict) else None
+
+
+def _fetch_openapi_paths(host: str, port: int, timeout: float) -> set[str] | None:
+    """Route set advertised by the server on ``host:port``, or None if unreadable."""
+    document = _fetch_openapi_document(host, port, timeout)
+    if document is None:
+        return None
+    paths = document.get("paths")
     if not isinstance(paths, dict):
         return None
     return set(paths)
+
+
+def _openapi_schema_properties(document: dict, schema_name: str) -> set[str]:
+    """Property names of one component schema in an OpenAPI document."""
+    schemas = (document.get("components") or {}).get("schemas") or {}
+    schema = schemas.get(schema_name) or {}
+    props = schema.get("properties") or {}
+    return set(props) if isinstance(props, dict) else set()
 
 
 def _verify_resident_evaluation_service(
@@ -269,7 +299,11 @@ def _verify_resident_evaluation_service(
     """
     role = _evaluation_service_label(api_server)
     required = _evaluation_service_required_routes(api_server)
-    served = _fetch_openapi_paths(host, port, probe_timeout)
+    document = _fetch_openapi_document(host, port, probe_timeout)
+    served = None
+    if document is not None:
+        paths = document.get("paths")
+        served = set(paths) if isinstance(paths, dict) else None
     pid = _evaluation_port_owner_pid(port)
     owner = f"pid {pid}" if pid is not None else "an unidentified process"
     if served is None:
@@ -288,6 +322,23 @@ def _verify_resident_evaluation_service(
             f"missing {missing}; it serves {sorted(served)}. That port is held by "
             f"{owner}. Stop it, or start the correct service there."
         )
+
+    # Routes matched. For services whose routes are NOT unique (SAM2 vs SAM3),
+    # discriminate on the request schema before adopting.
+    for schema_name, props in (
+        EVALUATION_SERVICE_REQUIRED_SCHEMA.get(str(api_server.get("_target_")), {})
+    ).items():
+        found = _openapi_schema_properties(document, schema_name)
+        missing_props = sorted(set(props) - found)
+        if missing_props:
+            raise RuntimeError(
+                f"Refusing to adopt the server already listening on {host}:{port} as "
+                f"{role}: its routes match but its request schema does not, so it is "
+                f"a different model behind the same API. {schema_name} is missing "
+                f"{missing_props}; it declares {sorted(found)}. (SAM2 and SAM3 serve "
+                f"identical paths -- this check is what separates them.) That port is "
+                f"held by {owner}. Stop it, or start the correct service there."
+            )
     return pid
 
 
