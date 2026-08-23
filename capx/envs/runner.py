@@ -19,6 +19,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -139,6 +140,18 @@ EVALUATION_SERVICE_URL_ENV: dict[str, str] = {
     "capx.serving.launch_pyroki_server.main": "PYROKI_SERVICE_URL",
 }
 
+#: Routes a session-scoped service must expose for its identity to be confirmed
+#: before the evaluation adopts an already-running instance of it.  Port numbers
+#: are not proof of identity: PyRoki also serves "/plan", so adopting whatever
+#: answers on 8215 could hand the evaluation a motion planner instead of a grasp
+#: planner.  Probed via the FastAPI "/openapi.json" document.
+EVALUATION_SERVICE_REQUIRED_ROUTES: dict[str, tuple[str, ...]] = {
+    "capx.serving.launch_sam3_server.main": ("/segment", "/segment_point"),
+    "capx.serving.launch_sam2_server.main": ("/segment", "/segment_point"),
+    "capx.serving.launch_contact_graspnet_server.main": ("/plan", "/plan_point_clouds"),
+    "capx.serving.launch_owlvit_server.main": ("/detect",),
+}
+
 #: Ports an evaluation service may never be allocated, and who owns them.
 RESERVED_EVALUATION_PORTS: dict[int, str] = {
     8122: "Molmo vLLM (hard-coded in capx/integrations/vision/molmo.py)",
@@ -149,7 +162,7 @@ RESERVED_EVALUATION_PORTS: dict[int, str] = {
 MAX_EVALUATION_WORKER_SLOTS = 20
 
 #: Keys this layer consumes that must not be forwarded to ``instantiate``.
-_EVALUATION_SERVICE_META_KEYS = ("scope", "url_env")
+_EVALUATION_SERVICE_META_KEYS = ("scope", "url_env", "required_routes")
 
 
 def evaluation_api_server_scope(api_server: dict) -> str:
@@ -211,6 +224,71 @@ def _evaluation_service_url_env(api_server: dict) -> str:
             f"{target!r}. Add it to EVALUATION_SERVICE_URL_ENV in capx/envs/runner.py, "
             f"or set an explicit 'url_env: <NAME>' on that entry."
         ) from None
+
+
+def _evaluation_service_required_routes(api_server: dict) -> tuple[str, ...]:
+    """Routes that prove a running server really is this service."""
+    explicit = api_server.get("required_routes")
+    if explicit:
+        return tuple(str(route) for route in explicit)
+    target = api_server.get("_target_")
+    try:
+        return EVALUATION_SERVICE_REQUIRED_ROUTES[target]
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"No identity routes known for session-scoped api_server {target!r}, so a "
+            f"server already listening on its port cannot be verified before adoption. "
+            f"Add it to EVALUATION_SERVICE_REQUIRED_ROUTES in capx/envs/runner.py, or "
+            f"set an explicit 'required_routes: [...]' on that entry. Refusing to adopt "
+            f"an unidentifiable server."
+        ) from None
+
+
+def _fetch_openapi_paths(host: str, port: int, timeout: float) -> set[str] | None:
+    """Route set advertised by the server on ``host:port``, or None if unreadable."""
+    url = f"http://{host}:{int(port)}/openapi.json"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            document = json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+    paths = document.get("paths") if isinstance(document, dict) else None
+    if not isinstance(paths, dict):
+        return None
+    return set(paths)
+
+
+def _verify_resident_evaluation_service(
+    api_server: dict, host: str, port: int, *, probe_timeout: float
+) -> int | None:
+    """Confirm the server already on ``host:port`` is ``api_server``; else raise.
+
+    Returns the owning PID when it can be determined.  Raises rather than
+    adopting anything it cannot positively identify: silently adopting the
+    wrong server is the failure mode this whole check exists to prevent.
+    """
+    role = _evaluation_service_label(api_server)
+    required = _evaluation_service_required_routes(api_server)
+    served = _fetch_openapi_paths(host, port, probe_timeout)
+    pid = _evaluation_port_owner_pid(port)
+    owner = f"pid {pid}" if pid is not None else "an unidentified process"
+    if served is None:
+        raise RuntimeError(
+            f"Refusing to adopt the server already listening on {host}:{port} as "
+            f"{role}: it returned no readable /openapi.json within {probe_timeout}s, "
+            f"so its identity cannot be confirmed. Expected routes "
+            f"{list(required)}. That port is held by {owner}. Stop it, or start the "
+            f"correct service there."
+        )
+    missing = sorted(set(required) - served)
+    if missing:
+        raise RuntimeError(
+            f"Refusing to adopt the server already listening on {host}:{port} as "
+            f"{role}: it is a different service. Expected routes {list(required)}, "
+            f"missing {missing}; it serves {sorted(served)}. That port is held by "
+            f"{owner}. Stop it, or start the correct service there."
+        )
+    return pid
 
 
 def _deduplicated_evaluation_api_servers(
@@ -367,29 +445,64 @@ def evaluation_worker_api_servers(
     return _deduplicated_evaluation_api_servers(api_server_sets, "worker")
 
 
+def evaluation_session_api_servers(
+    api_server_sets: list[list | None],
+) -> list[dict]:
+    """Deduplicated session-scoped service definitions across the given configs.
+
+    Useful to a caller that wants to report how many session services an
+    evaluation adopted versus started.
+    """
+    return _deduplicated_evaluation_api_servers(api_server_sets, "session")
+
+
 def start_evaluation_api_servers(
     api_server_sets: list[list | None],
     *,
     wait_timeout: float,
     child_env: dict[str, str] | None = None,
-    allow_existing: bool = False,
+    probe_timeout: float = 10.0,
 ) -> list:
-    """Start the deduplicated SESSION-scoped services once for the evaluation.
+    """Make the deduplicated SESSION-scoped services available to the evaluation.
+
+    Session services (segmentation, grasp proposal) are stateless across trials
+    and dominated by model-load time, so they are normally RESIDENT: started
+    once by an external keeper and shared by every evaluation.  This function
+    therefore ADOPTS a service that is already listening and starts one only
+    when nothing is.  The decision is automatic -- occupancy plus identity --
+    so no caller has to remember a flag, and a run still works with no keeper.
+
+    Adoption is identity-checked, never positional: the running server's
+    ``/openapi.json`` must expose the routes that service is required to serve
+    (:data:`EVALUATION_SERVICE_REQUIRED_ROUTES`, or a per-entry
+    ``required_routes``).  Anything else raises.
+
+    Adopted services are deliberately NOT in the returned list, so
+    :func:`_stop_api_servers` cannot reach them: an evaluation must never take
+    down a resident service it did not start.
 
     Args:
         api_server_sets: one ``api_servers`` list per selected env config.
-        wait_timeout: seconds to wait for all launched services to listen.
-            Required; this layer never supplies a default.
+        wait_timeout: seconds to wait for the services *this call starts* to
+            listen.  Required; this layer never supplies a default.
         child_env: environment overrides applied inside each service
-            subprocess only (never in the caller's ``os.environ``).
-        allow_existing: when False (default) an occupied port is an error.
+            subprocess this call starts, never in the caller's ``os.environ``.
+            It does not reach an adopted service -- its keeper chose its device.
+        probe_timeout: seconds allowed for the ``/openapi.json`` identity probe.
 
     Returns:
-        The started ``multiprocessing.Process`` objects, for ``_stop_api_servers``.
+        Only the processes this call started, for ``_stop_api_servers``.
+
+    Note:
+        There is deliberately no ``allow_existing`` parameter here any more.
+        Session scope always adopts a verified resident service.  The
+        per-worker path keeps ``allow_existing=False``, because a worker's
+        ports must be exclusively its own.
     """
-    session_servers = _deduplicated_evaluation_api_servers(api_server_sets, "session")
+    session_servers = evaluation_session_api_servers(api_server_sets)
     procs: list = []
     pending: list[tuple[str, int, str, Any]] = []
+    adopted: list[str] = []
     try:
         for api_server in session_servers:
             host = str(api_server.get("host", "127.0.0.1"))
@@ -397,25 +510,42 @@ def start_evaluation_api_servers(
             role = _evaluation_service_label(api_server)
             port = None if declared_port is None else int(declared_port)
             if port is not None:
-                if not _claim_evaluation_port(
-                    host, port, role=role, allow_existing=allow_existing
-                ):
-                    print(
-                        f"Evaluation session service {role} already served on "
-                        f"{host}:{port}; adopting it"
+                reserved = RESERVED_EVALUATION_PORTS.get(port)
+                if reserved is not None:
+                    raise RuntimeError(
+                        f"Evaluation session service {role} would bind reserved port "
+                        f"{port} ({reserved}). Change the declared port."
                     )
+                if _evaluation_port_is_open(host, port):
+                    pid = _verify_resident_evaluation_service(
+                        api_server, host, port, probe_timeout=probe_timeout
+                    )
+                    owner = f"pid={pid}" if pid is not None else "pid=unknown"
+                    print(
+                        f"[evaluation-services] ADOPTED {role} at {host}:{port} "
+                        f"({owner}) -- resident, identity verified; this evaluation "
+                        f"did NOT place it and will NOT stop it"
+                    )
+                    adopted.append(role)
                     continue
             proc = _start_evaluation_service_proc(
                 _evaluation_service_launch_config(api_server), child_env
             )
             procs.append(proc)
-            print(f"Evaluation session service {role} started on {host}:{port}")
+            print(
+                f"[evaluation-services] STARTED {role} at {host}:{port} -- owned by "
+                f"this evaluation and stopped at teardown"
+            )
             if port is not None:
                 pending.append((host, port, role, proc))
         _wait_for_evaluation_services(pending, wait_timeout)
     except BaseException:
         _stop_api_servers(procs)
         raise
+    print(
+        f"[evaluation-services] session services ready: {len(adopted)} adopted "
+        f"(left running), {len(procs)} started by this evaluation"
+    )
     return procs
 
 
