@@ -22,6 +22,7 @@ from robosuite.utils import RandomizationError
 from robosuite.utils.placement_samplers import ObjectPositionSampler
 from robosuite.utils.transform_utils import quat_multiply
 
+from capx.envs.simulators._paths import resolve_relative_to_capx
 from capx.envs.simulators.robosuite_base import RobosuiteBaseEnv
 
 
@@ -255,7 +256,7 @@ class FrankaRobosuiteCubesRestackLowLevel(RobosuiteBaseEnv):
         enable_render: bool = False,
     ) -> None:
         super().__init__(
-            controller_cfg=controller_cfg,
+            controller_cfg=resolve_relative_to_capx(controller_cfg),
             max_steps=max_steps,
             seed=seed,
             viser_debug=False,

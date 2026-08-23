@@ -16,6 +16,7 @@ import viser.transforms as vtf
 from robosuite.utils.camera_utils import get_real_depth_map
 
 from capx.envs.base import BaseEnv
+from capx.envs.simulators._paths import resolve_relative_to_capx
 from capx.utils.camera_utils import obs_get_rgb
 from capx.utils.depth_utils import depth_color_to_pointcloud
 
@@ -48,7 +49,9 @@ class RobosuiteBaseEnv(BaseEnv):
         enable_render: bool = False,
     ) -> None:
         super().__init__()
-        self.controller_cfg = controller_cfg
+        # Resolve relative controller_cfg paths against the cap-x repo root so
+        # robosuite's cwd-based ``open()`` works regardless of caller cwd.
+        self.controller_cfg = resolve_relative_to_capx(controller_cfg)
         self.max_steps = max_steps
         self.save_camera_name = "robot0_robotview"
         self.render_camera_names = [self.save_camera_name]
