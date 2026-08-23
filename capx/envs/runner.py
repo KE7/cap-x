@@ -44,12 +44,12 @@ from capx.utils.parallel_eval import run_parallel_with_setup
 # Constants
 # ---------------------------------------------------------------------------
 
-# Per-trial wall-clock cap (SIGALRM). Covers LLM generation + Isaac/curobo execution.
-# Raised from 1000s: with thinking disabled the LLM now returns code in ~53s, but the
-# generated grasp/settle code stepping Isaac physics blew the old 1000s cap mid-execution
-# (e.g. _settle_robot -> get_transforms), producing a 0.000 timeout artifact rather than a
-# real score. 2400s gives Isaac room to finish the trial while still bounding a true hang.
-TRIAL_TIMEOUT_SECONDS = 10800  # 3h/trial (reversible). Render-on-read made grasp+lift fast (oracle reward 1.0 in ~1374s); generous cap for the 122B M3 model run. See m3-gpu-rerun.
+# Per-trial wall-clock cap (SIGALRM). This is the value the benchmark commits on
+# origin/main. A local edit had raised it to 10800 for a separate 122B Isaac run
+# (see m3-gpu-rerun); that edit was removed so LIBERO evaluation is faithful to
+# the benchmark. Preserved at /home/batman/.cache/runner.py.with-10800 if the
+# Isaac run needs it back -- do NOT restore it while LIBERO is running.
+TRIAL_TIMEOUT_SECONDS = 1000
 MAX_TRIAL_RETRIES = 3
 
 

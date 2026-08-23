@@ -1,9 +1,10 @@
 import asyncio
 import base64
-import functools
 import io
 import logging
-from typing import Any, List, Tuple
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
+from typing import Any
 
 import numpy as np
 import torch
@@ -12,47 +13,47 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from PIL import Image
 from pydantic import BaseModel
-
 from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
 
+from capx.serving.drain_batcher import DrainBatcher
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-
-# Global state
 _PROCESSOR: Any | None = None
 _MODEL: Any | None = None
-_DEVICE: str = "cuda"
-
-# Semaphore to serialize GPU access (prevents OOM from concurrent inference)
-_GPU_SEMAPHORE = asyncio.Semaphore(1)
+_DEVICE = "cuda"
+_BATCHER: DrainBatcher[Any, Any] | None = None
 
 
-async def _run_on_gpu(fn, *args, **kwargs):
-    """Run a blocking GPU function without blocking the event loop."""
-    async with _GPU_SEMAPHORE:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    """One worker owns SAM3's mutable processor state for the whole service."""
+    global _BATCHER
+    _BATCHER = DrainBatcher(_run_batch, name="sam3")
+    await _BATCHER.start()
+    try:
+        yield
+    finally:
+        await _BATCHER.close()
+        _BATCHER = None
 
-# --- Helper Functions ---
+
+app = FastAPI(lifespan=_lifespan)
 
 
 def _to_numpy(tensor: Any) -> np.ndarray:
-    """Convert tensor-like object to numpy array."""
     if hasattr(tensor, "detach"):
-        t = tensor.detach().cpu()
-        if t.dtype == torch.bfloat16:
-            t = t.float()
-        return t.numpy()
+        tensor = tensor.detach().cpu()
+        if tensor.dtype == torch.bfloat16:
+            tensor = tensor.float()
+        return tensor.numpy()
     if hasattr(tensor, "cpu"):
-        t = tensor.cpu()
-        if hasattr(t, "dtype") and t.dtype == torch.bfloat16:
-            t = t.float()
-        return t.numpy()
+        tensor = tensor.cpu()
+        if hasattr(tensor, "dtype") and tensor.dtype == torch.bfloat16:
+            tensor = tensor.float()
+        return tensor.numpy()
     if hasattr(tensor, "numpy"):
         return tensor.numpy()
     return np.asarray(tensor)
@@ -60,24 +61,17 @@ def _to_numpy(tensor: Any) -> np.ndarray:
 
 def decode_image(base64_str: str) -> Image.Image:
     try:
-        image_data = base64.b64decode(base64_str)
-        image = Image.open(io.BytesIO(image_data)).convert("RGB")
-        return image
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image data: {e}")
+        return Image.open(io.BytesIO(base64.b64decode(base64_str))).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid image data: {exc}") from exc
 
 
 def encode_mask(mask: np.ndarray) -> str:
-    # Pack boolean mask to bytes (uint8) then base64
     return base64.b64encode(mask.astype(np.uint8).tobytes()).decode("utf-8")
 
 
 def encode_array(arr: np.ndarray) -> str:
-    """Encode a numpy array as base64 bytes."""
     return base64.b64encode(np.ascontiguousarray(arr).tobytes()).decode("utf-8")
-
-
-# --- Request/Response Models ---
 
 
 class SegmentRequest(BaseModel):
@@ -87,20 +81,20 @@ class SegmentRequest(BaseModel):
 
 class PointPromptRequest(BaseModel):
     image_base64: str
-    point_coords: list[float]  # [x, y] — JSON arrays, not tuples
+    point_coords: list[float]
 
 
 class PointPromptResponse(BaseModel):
     scores: list[float]
     masks_base64: str
-    masks_shape: list[int]  # [num_masks, H, W]
+    masks_shape: list[int]
     masks_dtype: str
 
 
 class MaskData(BaseModel):
     mask_base64: str
-    shape: list[int]  # [H, W]
-    box: list[float]  # [x1, y1, x2, y2]
+    shape: list[int]
+    box: list[float]
     score: float
     label: str
 
@@ -109,103 +103,110 @@ class SegmentResponse(BaseModel):
     results: list[MaskData]
 
 
-# --- Core Logic ---
+@dataclass
+class _TextWork:
+    image: Image.Image
+    text_prompt: str
 
 
-def _do_segment(pil_image: Image.Image, text_prompt: str):
-    """Blocking SAM3 text-prompt segmentation (runs on GPU thread)."""
-    _device_type = "cuda" if "cuda" in _DEVICE else "cpu"
-    dtype_context = torch.autocast(_device_type, dtype=torch.bfloat16)
+@dataclass
+class _PointWork:
+    image: Image.Image
+    point_coords: tuple[float, float]
 
-    with dtype_context:
-        inference_state = _PROCESSOR.set_image(pil_image)
-        output = _PROCESSOR.set_text_prompt(state=inference_state, prompt=text_prompt)
 
-    masks_tensor = output.get("masks")
-    boxes_tensor = output.get("boxes")
-    scores_tensor = output.get("scores")
+def _autocast_context():
+    device_type = "cuda" if "cuda" in _DEVICE else "mps" if "mps" in _DEVICE else "cpu"
+    return torch.autocast(device_type, dtype=torch.bfloat16)
 
-    if masks_tensor is None or boxes_tensor is None:
-        return SegmentResponse(results=[])
 
-    masks_np = _to_numpy(masks_tensor)
-    boxes_np = _to_numpy(boxes_tensor)
-    scores_np = _to_numpy(scores_tensor)
+def _segment_responses_from_batch(
+    outputs: dict[str, Any], works: list[_TextWork]
+) -> list[SegmentResponse]:
+    """Apply per-image thresholds, scaling, and serialization after one forward."""
+    masks = outputs.get("pred_masks")
+    boxes = outputs.get("pred_boxes")
+    logits = outputs.get("pred_logits")
+    presence = outputs.get("presence_logit_dec")
+    if masks is None or boxes is None or logits is None or presence is None:
+        return [SegmentResponse(results=[]) for _ in works]
 
-    # Squeeze masks if needed: (N, 1, H, W) -> (N, H, W)
-    if masks_np.ndim == 4 and masks_np.shape[1] == 1:
-        masks_np = masks_np.squeeze(1)
-
-    results_data = []
-    num_preds = len(scores_np)
-
-    for i in range(num_preds):
-        mask = masks_np[i] > 0  # Boolean mask
-        box = boxes_np[i].tolist()  # [x1, y1, x2, y2]
-        score = float(scores_np[i])
-
-        results_data.append(
-            MaskData(
-                mask_base64=encode_mask(mask),
-                shape=mask.shape,
-                box=box,
-                score=score,
-                label=text_prompt,
+    scores = (logits.sigmoid() * presence.sigmoid().unsqueeze(1)).squeeze(-1)
+    responses: list[SegmentResponse] = []
+    for index, work in enumerate(works):
+        height, width = work.image.height, work.image.width
+        keep = scores[index] > _PROCESSOR.confidence_threshold
+        item_masks = (
+            torch.nn.functional.interpolate(
+                masks[index][keep].unsqueeze(1),
+                (height, width),
+                mode="bilinear",
+                align_corners=False,
             )
+            .squeeze(1)
+            .sigmoid()
         )
+        item_boxes = boxes[index][keep]
+        item_boxes = torch.stack(
+            (
+                item_boxes[:, 0] - item_boxes[:, 2] / 2,
+                item_boxes[:, 1] - item_boxes[:, 3] / 2,
+                item_boxes[:, 0] + item_boxes[:, 2] / 2,
+                item_boxes[:, 1] + item_boxes[:, 3] / 2,
+            ),
+            dim=-1,
+        ) * item_boxes.new_tensor([width, height, width, height])
+        results = [
+            MaskData(
+                mask_base64=encode_mask(mask > 0.5),
+                shape=mask.shape,
+                box=box.tolist(),
+                score=float(score),
+                label=work.text_prompt,
+            )
+            for mask, box, score in zip(
+                _to_numpy(item_masks),
+                _to_numpy(item_boxes),
+                _to_numpy(scores[index][keep]),
+                strict=True,
+            )
+        ]
+        results.sort(key=lambda item: item.score, reverse=True)
+        responses.append(SegmentResponse(results=results))
+    return responses
 
-    # Sort by score descending
-    results_data.sort(key=lambda x: x.score, reverse=True)
 
-    return SegmentResponse(results=results_data)
-
-
-@app.post("/segment", response_model=SegmentResponse)
-async def segment(req: SegmentRequest):
-    if _PROCESSOR is None:
-        raise HTTPException(status_code=503, detail="Model not initialized")
-
-    pil_image = decode_image(req.image_base64)
-
-    try:
-        return await _run_on_gpu(_do_segment, pil_image, req.text_prompt)
-    except Exception as e:
-        logger.error(f"Inference failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Inference failed: {e}")
-
-
-def _do_segment_point(pil_image: Image.Image, point_coords_tuple: tuple[float, float]):
-    """Blocking SAM3 point-prompt segmentation (runs on GPU thread)."""
-    _device_type = "cuda" if "cuda" in _DEVICE else "cpu"
-    dtype_context = torch.autocast(_device_type, dtype=torch.bfloat16)
-
-    with dtype_context:
-        inference_state = _PROCESSOR.set_image(pil_image)
-        point_coords = np.array([list(point_coords_tuple)], dtype=np.float32)
-        point_labels = np.array([1], dtype=np.int64)  # foreground point
-        masks, scores, _ = _MODEL.predict_inst(
-            inference_state,
-            point_coords=point_coords,
-            point_labels=point_labels,
-            multimask_output=True,
+def _do_segment_batch(works: list[_TextWork]) -> list[SegmentResponse]:
+    """Run every currently queued text request through one SAM3 forward pass."""
+    assert _PROCESSOR is not None and _MODEL is not None
+    batch_size = len(works)
+    with _autocast_context():
+        state = _PROCESSOR.set_image_batch([work.image for work in works])
+        state["backbone_out"].update(
+            _MODEL.backbone.forward_text([work.text_prompt for work in works], device=_DEVICE)
         )
+        find_input = replace(
+            _PROCESSOR.find_stage,
+            img_ids=torch.arange(batch_size, device=_DEVICE, dtype=torch.long),
+            text_ids=torch.arange(batch_size, device=_DEVICE, dtype=torch.long),
+        )
+        outputs = _MODEL.forward_grounding(
+            backbone_out=state["backbone_out"],
+            find_input=find_input,
+            find_target=None,
+            geometric_prompt=_MODEL._get_dummy_prompt(num_prompts=batch_size),
+        )
+    return _segment_responses_from_batch(outputs, works)
 
-    masks_np = np.asarray(masks)
-    scores_np = np.asarray(scores)
 
+def _point_response(masks: Any, scores: Any) -> PointPromptResponse:
+    masks_np, scores_np = np.asarray(masks), np.asarray(scores)
     if masks_np.size == 0 or scores_np.size == 0:
         return PointPromptResponse(
-            scores=[],
-            masks_base64="",
-            masks_shape=(0, 0, 0),
-            masks_dtype="float32",
+            scores=[], masks_base64="", masks_shape=(0, 0, 0), masks_dtype="float32"
         )
-
-    # Sort by score descending
-    sort_idx = np.argsort(scores_np)[::-1]
-    masks_np = masks_np[sort_idx]
-    scores_np = scores_np[sort_idx]
-
+    order = np.argsort(scores_np)[::-1]
+    masks_np, scores_np = masks_np[order], scores_np[order]
     return PointPromptResponse(
         scores=scores_np.astype(float).tolist(),
         masks_base64=encode_array(masks_np),
@@ -214,60 +215,76 @@ def _do_segment_point(pil_image: Image.Image, point_coords_tuple: tuple[float, f
     )
 
 
+def _do_segment_point_batch(works: list[_PointWork]) -> list[PointPromptResponse]:
+    """Batch image embeddings and use SAM3's prompt-mode batch API."""
+    assert _PROCESSOR is not None and _MODEL is not None
+    with _autocast_context():
+        state = _PROCESSOR.set_image_batch([work.image for work in works])
+        masks, scores, _ = _MODEL.predict_inst_batch(
+            state,
+            point_coords_batch=[np.array([work.point_coords], dtype=np.float32) for work in works],
+            point_labels_batch=[np.array([1], dtype=np.int64) for _ in works],
+            multimask_output=True,
+        )
+    return [_point_response(mask, score) for mask, score in zip(masks, scores, strict=True)]
+
+
+def _run_batch(kind: str, works: list[Any]) -> list[Any]:
+    if kind == "text":
+        return _do_segment_batch(works)
+    if kind == "point":
+        return _do_segment_point_batch(works)
+    raise ValueError(f"Unknown SAM3 request kind: {kind}")
+
+
+@app.post("/segment", response_model=SegmentResponse)
+async def segment(req: SegmentRequest):
+    if _PROCESSOR is None or _BATCHER is None:
+        raise HTTPException(status_code=503, detail="Model not initialized")
+    try:
+        return await _BATCHER.submit(
+            "text", _TextWork(decode_image(req.image_base64), req.text_prompt)
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Inference failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
+
+
 @app.post("/segment_point", response_model=PointPromptResponse)
 async def segment_point(req: PointPromptRequest):
-    if _PROCESSOR is None or _MODEL is None:
+    if _PROCESSOR is None or _MODEL is None or _BATCHER is None:
         raise HTTPException(status_code=503, detail="Model not initialized")
     if getattr(_MODEL, "inst_interactive_predictor", None) is None:
         raise HTTPException(
-            status_code=503,
-            detail="Instance interactivity not enabled on SAM3 model",
+            status_code=503, detail="Instance interactivity not enabled on SAM3 model"
         )
-
-    pil_image = decode_image(req.image_base64)
-
     try:
-        return await _run_on_gpu(_do_segment_point, pil_image, req.point_coords)
-    except Exception as e:
-        logger.error(f"Point prompt inference failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Point prompt inference failed: {e}")
+        return await _BATCHER.submit(
+            "point", _PointWork(decode_image(req.image_base64), tuple(req.point_coords))
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Point prompt inference failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
 
 
-def main(
-    device: str = "cuda",
-    port: int = 8114,
-    host: str = "127.0.0.1",
-):
+def main(device: str = "cuda", port: int = 8114, host: str = "127.0.0.1"):
     global _MODEL, _PROCESSOR, _DEVICE
-
     _DEVICE = device
-
-    # Setup torch settings for Ampere+ GPUs as recommended
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        # Set the default CUDA device so all tensor allocations inside
-        # build_sam3_image_model and Sam3Processor use the correct device.
-        # Without this, internal tensors default to cuda:0 while model
-        # weights are on the specified device, causing device mismatch errors.
         if "cuda" in device:
-            device_idx = int(device.split(":")[-1]) if ":" in device else 0
-            torch.cuda.set_device(device_idx)
-
+            torch.cuda.set_device(int(device.split(":")[-1]) if ":" in device else 0)
     logger.info("Loading SAM3 model...")
-    try:
-        # Assuming build_sam3_image_model loads default checkpoint
-        _MODEL = build_sam3_image_model(enable_inst_interactivity=True)
-    except Exception as e:
-        logger.error(f"Error building SAM3 model: {e}")
-        raise
-
+    _MODEL = build_sam3_image_model(enable_inst_interactivity=True)
     if hasattr(_MODEL, "to") and device:
         _MODEL = _MODEL.to(device)
-
     _PROCESSOR = Sam3Processor(_MODEL, device=device, confidence_threshold=0.0)
-    logger.info(f"SAM3 model loaded on {device}. Starting Server...")
-
+    logger.info("SAM3 model loaded on %s. Starting server...", device)
     uvicorn.run(app, host=host, port=port)
 
 
