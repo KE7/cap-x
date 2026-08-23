@@ -77,6 +77,16 @@ class FrankaLiberoEnv(BaseEnv):
         self._current_reward = None
         self._current_done = None
 
+        # Render-on-read optimization state. The blocking primitive loops
+        # (move_to_joints_blocking, _step_once) step env.step many times but the
+        # agent only consumes camera pixels via get_observation() at the *end* of
+        # a primitive. We disable the camera observables so env.step skips the
+        # wasted offscreen render, and force a fresh render-on-read inside
+        # get_observation(). Populated/refreshed in reset() (observables are
+        # recreated on env.reset()).
+        self._camera_obs_names: list[str] = []
+        self._camera_obs_enabled: bool = True
+
         # Video capture
         self._record_frames = False
         self._frame_buffer: list[np.ndarray] = []
@@ -175,6 +185,14 @@ class FrankaLiberoEnv(BaseEnv):
         self._current_joints = self.handle.env.sim.data.qpos[:7].copy()
         self.home_joint_position = np.array(libero_obs["robot0_joint_pos"], dtype=np.float64)
         self._gripper_fraction = 1.0
+
+        # Render-on-read: disable camera observables so the settle loop below and
+        # the subsequent blocking primitive loops skip the per-step offscreen
+        # render whose frames are discarded. get_observation() force-renders a
+        # fresh frame on demand. Observables are recreated by env.reset(), so we
+        # (re-)derive the names and disable them here on every reset.
+        self._init_camera_observable_names()
+        self._set_camera_observables(False)
 
         # Post-reset settling: let physics stabilize (objects drop, joints settle).
         # 10 steps suffice — joints converge by step ~5.
@@ -429,8 +447,116 @@ class FrankaLiberoEnv(BaseEnv):
     def compute_reward(self) -> float:
         return self._current_reward
 
+    def _init_camera_observable_names(self) -> None:
+        """Identify the render-bearing camera observables (rgb / depth / segmentation).
+
+        These are the observables whose sensors trigger an offscreen render inside
+        robosuite's per-step ``_update_observables``. Re-derived after every
+        env.reset() because robosuite recreates the observable objects on reset.
+        """
+        robo = self.handle.env.env
+        self._camera_obs_names = [
+            nm
+            for nm in robo._observables
+            if nm.endswith("_image") or nm.endswith("_depth") or "_segmentation_" in nm
+        ]
+
+    def _set_camera_observables(self, enabled: bool) -> None:
+        """Enable/disable the camera observables so env.step renders / skips render.
+
+        When disabled, robosuite's ``Observable.update`` short-circuits before
+        calling the camera sensor, so no offscreen render fires during env.step.
+        State used by the primitive loops (joint qpos, object poses) comes from
+        ``sim.data``, not from these observables, so the loops are unaffected.
+        """
+        robo = self.handle.env.env
+        for nm in self._camera_obs_names:
+            robo.modify_observable(nm, "enabled", enabled)
+            robo.modify_observable(nm, "active", enabled)
+        self._camera_obs_enabled = enabled
+
+    def _refresh_camera_obs(self) -> None:
+        """Render-on-read: render fresh camera pixels for the *current* sim state.
+
+        Mirrors the known-good ``regenerate_obs_from_state`` path (sim.forward +
+        force update + _get_observations) without stepping/altering the
+        simulation. No-op if cameras are already live.
+
+        Bit-identical to a per-step render ONLY AFTER ``mj_forward`` has run --
+        and that is the point.  ``mj_step`` advances ``qpos`` but does not
+        recompute the dependent scene state, and robosuite's per-step render
+        fires inside ``_update_observables()`` before anything calls
+        ``mj_forward``.  The per-step frame therefore shows STALE derived
+        geometry; calling ``sim.forward()`` here renders the true current state.
+
+        Measured on libero_goal_0 init-state 1 in the post-reset state (the
+        driver called FrankaLiberoEnv.step(), which does NOT advance physics --
+        only reset's 10-step settle loop ran).  Each arm is deterministic across
+        repeated runs, so these are real differences, but do NOT cite these
+        figures as covering a moving trajectory:
+
+            wrist depth, upstream per-step render   sha bacbf5ed8bb0be7a
+            wrist depth, upstream + sim.forward()   sha f9d7d9eb5d8d6f14
+            wrist depth, this render-on-read path   sha f9d7d9eb5d8d6f14  <- match
+
+        In this arm ``sim.forward()`` is then a no-op (0 of 409600 px change);
+        in the upstream arm it moves 6537 of 409600 px by up to 6.99e-02.  The
+        camera pose is NOT the cause -- it is already converged (position delta
+        3e-17, rotation delta 9e-16).  What differs is the scene: the gripper
+        and the nearby objects the wrist camera looks at.
+
+        The static agentview camera barely moves (98/409600 px, max 1.39e-04);
+        the wrist camera, whose near field is exactly the moving parts, carries
+        essentially all of it.
+
+        The extra sim.forward() is TRAJECTORY-NEUTRAL, measured, not assumed:
+        60 real physics steps on a fixed action sequence, with sim.forward()
+        injected every 10 steps in one arm, give bit-identical qpos AND qvel
+        (max|delta| 0.000e+00 for both).  The control -- the same arm run twice
+        -- is likewise 0.000e+00, so the comparison is valid.  See
+        rho-cap-libero-v2/scripts/test_forward_trajectory.py.
+
+        So this is not an approximation of the per-step render -- it is the
+        corrected one.  Do not "restore benchmark fidelity" by deleting it.
+        """
+        if self._camera_obs_enabled:
+            # Cameras are live, i.e. the upstream per-step render path is in
+            # effect and _current_obs was populated by it.
+            return
+        robo = self.handle.env.env
+        self._set_camera_observables(True)
+        try:
+            robo.sim.forward()
+            robo._update_observables(force=True)
+            self._current_obs = robo._get_observations()
+        finally:
+            # Without this, a raising render (e.g. EGL loss) would leave the
+            # observables enabled; every later call would then early-return and
+            # silently disable the optimisation for the rest of the trial.
+            self._set_camera_observables(False)
+
+        # robosuite gates _get_observations on is_enabled() and is_active(), so a
+        # refresh that failed to fire yields an observation with the camera keys
+        # ABSENT rather than stale -- and get_observation() guards every read with
+        # `if key in ...`, which would hand the agent a silently image-less
+        # observation. Fail loudly instead.
+        missing = [
+            name for name in self._camera_obs_names
+            if name not in self._current_obs
+        ]
+        if missing:
+            raise RuntimeError(
+                "render-on-read refresh produced no camera observables: "
+                f"{missing}. The agent would otherwise receive an observation "
+                "with no images and no error."
+            )
+
     def get_observation(self) -> dict[str, Any]:
         """Get observation in FrankaLiberoEnv format."""
+        # Render-on-read: camera rendering is skipped during the blocking
+        # primitive loops; produce a fresh camera frame for the current sim state
+        # now, exactly when the agent actually consumes the pixels.
+        self._refresh_camera_obs()
         obs = {}
 
         camera_names = [
