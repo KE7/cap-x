@@ -7,10 +7,18 @@ single-trial execution lives in :mod:`capx.envs.trial`.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import functools
+import json
+import multiprocessing
 import os
+import re
 import signal
+import socket
+import subprocess
 import sys
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -36,7 +44,12 @@ from capx.utils.parallel_eval import run_parallel_with_setup
 # Constants
 # ---------------------------------------------------------------------------
 
-TRIAL_TIMEOUT_SECONDS = 1000
+# Per-trial wall-clock cap (SIGALRM). Covers LLM generation + Isaac/curobo execution.
+# Raised from 1000s: with thinking disabled the LLM now returns code in ~53s, but the
+# generated grasp/settle code stepping Isaac physics blew the old 1000s cap mid-execution
+# (e.g. _settle_robot -> get_transforms), producing a 0.000 timeout artifact rather than a
+# real score. 2400s gives Isaac room to finish the trial while still bounding a true hang.
+TRIAL_TIMEOUT_SECONDS = 10800  # 3h/trial (reversible). Render-on-read made grasp+lift fast (oracle reward 1.0 in ~1374s); generous cap for the 122B M3 model run. See m3-gpu-rerun.
 MAX_TRIAL_RETRIES = 3
 
 
@@ -93,6 +106,428 @@ def _stop_api_servers(server_procs: list) -> None:
     for proc in server_procs:
         proc.terminate()
         proc.join(timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# Evaluation service layer
+# ---------------------------------------------------------------------------
+#
+# Infrastructure for harnesses that fan a single evaluation out over several
+# rollout worker processes.  Some CaP-X services (segmentation, grasp
+# proposal) are stateless and expensive to load, so one instance is shared by
+# the whole evaluation; others (motion planning) hold per-episode state and
+# must be private to a worker.
+#
+# Nothing in this layer reads a module-level timeout or retry constant: every
+# caller passes its own numbers in, so one experiment's constants can never
+# silently become another's.
+
+#: Default scope for each known CaP-X service entry point.
+#:
+#: ``"session"`` -> one instance shared by the whole evaluation.
+#: ``"worker"``  -> one instance per parallel rollout worker.
+EVALUATION_SERVICE_SCOPE: dict[str, str] = {
+    "capx.serving.launch_sam3_server.main": "session",
+    "capx.serving.launch_sam2_server.main": "session",
+    "capx.serving.launch_contact_graspnet_server.main": "session",
+    "capx.serving.launch_owlvit_server.main": "session",
+    "capx.serving.launch_pyroki_server.main": "worker",
+}
+
+#: Environment variable a worker-scoped service's client reads to find it.
+EVALUATION_SERVICE_URL_ENV: dict[str, str] = {
+    "capx.serving.launch_pyroki_server.main": "PYROKI_SERVICE_URL",
+}
+
+#: Ports an evaluation service may never be allocated, and who owns them.
+RESERVED_EVALUATION_PORTS: dict[int, str] = {
+    8122: "Molmo vLLM (hard-coded in capx/integrations/vision/molmo.py)",
+    8129: "LIBERO development sidecar",
+}
+
+#: Ceiling on parallel evaluation workers; bounds the worker port span.
+MAX_EVALUATION_WORKER_SLOTS = 20
+
+#: Keys this layer consumes that must not be forwarded to ``instantiate``.
+_EVALUATION_SERVICE_META_KEYS = ("scope", "url_env")
+
+
+def evaluation_api_server_scope(api_server: dict) -> str:
+    """Return ``"session"`` or ``"worker"`` for one ``api_servers`` entry.
+
+    An explicit ``scope`` key wins; :data:`EVALUATION_SERVICE_SCOPE` is the
+    default.  Raises for an unclassifiable service rather than defaulting,
+    because a wrong default silently un-shares the vision services or silently
+    shares a per-worker service -- neither of which shows up in a diff.
+    """
+    explicit = api_server.get("scope")
+    if explicit is not None:
+        if explicit not in ("session", "worker"):
+            raise ValueError(
+                f"api_server scope must be 'session' or 'worker', got {explicit!r} "
+                f"for {api_server.get('_target_')!r}"
+            )
+        return str(explicit)
+    target = api_server.get("_target_")
+    try:
+        return EVALUATION_SERVICE_SCOPE[target]
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"No evaluation scope known for api_server {target!r}. Add it to "
+            f"EVALUATION_SERVICE_SCOPE in capx/envs/runner.py, or set an explicit "
+            f"'scope: session|worker' on that entry. Refusing to guess: a wrong "
+            f"scope silently changes whether the service is shared across workers."
+        ) from None
+
+
+def _evaluation_service_label(api_server: dict) -> str:
+    return str(api_server.get("_target_", "<unnamed api_server>"))
+
+
+def _evaluation_service_key(api_server: dict) -> str:
+    """Stable identity for de-duplicating identical service declarations."""
+    return json.dumps(api_server, sort_keys=True, default=repr)
+
+
+def _evaluation_service_launch_config(api_server: dict) -> dict:
+    """Copy of ``api_server`` with this layer's own keys removed."""
+    cfg = copy.deepcopy(dict(api_server))
+    for key in _EVALUATION_SERVICE_META_KEYS:
+        cfg.pop(key, None)
+    return cfg
+
+
+def _evaluation_service_url_env(api_server: dict) -> str:
+    """Name of the env var a client reads to reach this worker-scoped service."""
+    explicit = api_server.get("url_env")
+    if explicit:
+        return str(explicit)
+    target = api_server.get("_target_")
+    try:
+        return EVALUATION_SERVICE_URL_ENV[target]
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"No client URL environment variable known for worker-scoped api_server "
+            f"{target!r}. Add it to EVALUATION_SERVICE_URL_ENV in capx/envs/runner.py, "
+            f"or set an explicit 'url_env: <NAME>' on that entry."
+        ) from None
+
+
+def _deduplicated_evaluation_api_servers(
+    api_server_sets: Iterable[list | None], scope: str
+) -> list[dict]:
+    """Distinct ``scope``-scoped service declarations across several configs."""
+    seen: set[str] = set()
+    ordered: list[dict] = []
+    by_port: dict[int, dict] = {}
+    for api_servers in api_server_sets or []:
+        if not api_servers:
+            continue
+        for api_server in api_servers:
+            entry = dict(api_server)
+            if evaluation_api_server_scope(entry) != scope:
+                continue
+            key = _evaluation_service_key(entry)
+            if key in seen:
+                continue
+            port = entry.get("port")
+            if port is not None:
+                clash = by_port.get(int(port))
+                if clash is not None:
+                    raise ValueError(
+                        f"Two different {scope}-scoped api_server declarations both "
+                        f"claim port {int(port)}: {_evaluation_service_label(clash)!r} "
+                        f"and {_evaluation_service_label(entry)!r}. Give them distinct "
+                        f"ports; refusing to guess which one wins."
+                    )
+                by_port[int(port)] = entry
+            seen.add(key)
+            ordered.append(entry)
+    return ordered
+
+
+def _evaluation_port_is_open(host: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(1.0)
+        return sock.connect_ex((host, int(port))) == 0
+
+
+def _evaluation_port_owner_pid(port: int) -> int | None:
+    """Best-effort PID of whatever is listening on ``port`` (None if unknown)."""
+    try:
+        completed = subprocess.run(
+            ["ss", "-ltnp"], capture_output=True, text=True, timeout=5.0
+        )
+    except Exception:
+        return None
+    for line in completed.stdout.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        if fields[3].rsplit(":", 1)[-1] != str(int(port)):
+            continue
+        match = re.search(r"pid=(\d+)", line)
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+def _claim_evaluation_port(
+    host: str, port: int, *, role: str, allow_existing: bool
+) -> bool:
+    """Validate ``port`` for ``role``; return True when we should start a server.
+
+    Returns False only when the port is already served and ``allow_existing``
+    permits adopting it.  Unlike :func:`_start_api_servers`, an occupied port is
+    an error by default: an evaluation must never silently adopt a server whose
+    configuration and GPU placement it does not know.
+    """
+    reserved = RESERVED_EVALUATION_PORTS.get(int(port))
+    if reserved is not None:
+        raise RuntimeError(
+            f"Evaluation service {role} would bind reserved port {port} ({reserved}). "
+            f"Change the declared port or reduce the worker-slot span."
+        )
+    if not _evaluation_port_is_open(host, int(port)):
+        return True
+    if allow_existing:
+        return False
+    pid = _evaluation_port_owner_pid(int(port))
+    owner = f", owned by pid {pid}" if pid is not None else ""
+    raise RuntimeError(
+        f"Port {host}:{port} is already in use{owner}; refusing to adopt it for "
+        f"{role}. Stop that listener, or pass allow_existing=True if reusing an "
+        f"already-running service is intended."
+    )
+
+
+def _wait_for_evaluation_services(
+    pending: list[tuple[str, int, str, Any]], wait_timeout: float
+) -> None:
+    """Block until every launched service accepts connections, else raise."""
+    if not pending:
+        return
+    deadline = time.monotonic() + float(wait_timeout)
+    for host, port, role, proc in pending:
+        while True:
+            if _evaluation_port_is_open(host, port):
+                print(f"Evaluation service {role} on {host}:{port} is ready")
+                break
+            if proc is not None and not proc.is_alive():
+                raise RuntimeError(
+                    f"Evaluation service {role} exited with code {proc.exitcode} "
+                    f"before accepting connections on {host}:{port}"
+                )
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Evaluation service {role} did not accept connections on "
+                    f"{host}:{port} within {wait_timeout}s"
+                )
+            time.sleep(0.5)
+
+
+def _run_server_proc_with_env(api_cfg, child_env: dict[str, str]) -> None:
+    """Service subprocess entry point that applies ``child_env`` first.
+
+    ``run_server_proc`` starts a ``multiprocessing.Process``, which inherits the
+    parent's ``os.environ`` at fork/spawn time.  Setting e.g.
+    ``CUDA_VISIBLE_DEVICES`` in the parent to place a service would therefore
+    leak into every rollout worker started afterwards and silently colocate the
+    vision services on the rollout device.  Applying it here -- inside the
+    child, before ``instantiate`` imports/initialises any CUDA or JAX backend --
+    keeps the override scoped to this one service.
+    """
+    if child_env:
+        os.environ.update({str(k): str(v) for k, v in child_env.items()})
+    instantiate(api_cfg)
+
+
+def _start_evaluation_service_proc(api_cfg, child_env: dict[str, str] | None):
+    """Start one service subprocess, optionally with an overridden environment."""
+    if not child_env:
+        return run_server_proc(api_cfg)
+    ctx = multiprocessing.get_context("spawn")
+    proc = ctx.Process(
+        target=_run_server_proc_with_env,
+        args=(api_cfg, dict(child_env)),
+        daemon=True,
+    )
+    proc.start()
+    return proc
+
+
+def evaluation_worker_api_servers(
+    api_server_sets: list[list | None],
+) -> list[dict]:
+    """Deduplicated worker-scoped service definitions across the given configs.
+
+    The returned dicts still carry their *declared* port; the per-worker offset
+    is applied by :func:`start_evaluation_worker_api_servers`.
+    """
+    return _deduplicated_evaluation_api_servers(api_server_sets, "worker")
+
+
+def start_evaluation_api_servers(
+    api_server_sets: list[list | None],
+    *,
+    wait_timeout: float,
+    child_env: dict[str, str] | None = None,
+    allow_existing: bool = False,
+) -> list:
+    """Start the deduplicated SESSION-scoped services once for the evaluation.
+
+    Args:
+        api_server_sets: one ``api_servers`` list per selected env config.
+        wait_timeout: seconds to wait for all launched services to listen.
+            Required; this layer never supplies a default.
+        child_env: environment overrides applied inside each service
+            subprocess only (never in the caller's ``os.environ``).
+        allow_existing: when False (default) an occupied port is an error.
+
+    Returns:
+        The started ``multiprocessing.Process`` objects, for ``_stop_api_servers``.
+    """
+    session_servers = _deduplicated_evaluation_api_servers(api_server_sets, "session")
+    procs: list = []
+    pending: list[tuple[str, int, str, Any]] = []
+    try:
+        for api_server in session_servers:
+            host = str(api_server.get("host", "127.0.0.1"))
+            declared_port = api_server.get("port")
+            role = _evaluation_service_label(api_server)
+            port = None if declared_port is None else int(declared_port)
+            if port is not None:
+                if not _claim_evaluation_port(
+                    host, port, role=role, allow_existing=allow_existing
+                ):
+                    print(
+                        f"Evaluation session service {role} already served on "
+                        f"{host}:{port}; adopting it"
+                    )
+                    continue
+            proc = _start_evaluation_service_proc(
+                _evaluation_service_launch_config(api_server), child_env
+            )
+            procs.append(proc)
+            print(f"Evaluation session service {role} started on {host}:{port}")
+            if port is not None:
+                pending.append((host, port, role, proc))
+        _wait_for_evaluation_services(pending, wait_timeout)
+    except BaseException:
+        _stop_api_servers(procs)
+        raise
+    return procs
+
+
+def start_evaluation_worker_api_servers(
+    worker_api_servers: list[dict],
+    *,
+    worker_slot: int,
+    wait_timeout: float,
+    allow_existing: bool = False,
+) -> tuple[list, dict[str, str]]:
+    """Start this worker's own services; return ``(procs, client_env)``.
+
+    Each service binds ``declared_port + worker_slot`` so that N workers get N
+    disjoint endpoints.  Every computed port is checked against
+    :data:`RESERVED_EVALUATION_PORTS` and against actual occupancy, so a slot
+    that would land on another system's port fails loudly instead of producing
+    a mysterious downstream error.
+
+    ``client_env`` maps each service's URL environment variable to this
+    worker's endpoint; the caller (or :func:`worker_service_session`) is
+    responsible for scoping it to the worker's lifetime.
+    """
+    slot = int(worker_slot)
+    if slot < 0 or slot >= MAX_EVALUATION_WORKER_SLOTS:
+        raise ValueError(
+            f"worker_slot must be in [0, {MAX_EVALUATION_WORKER_SLOTS}), "
+            f"got {worker_slot!r}"
+        )
+    procs: list = []
+    pending: list[tuple[str, int, str, Any]] = []
+    client_env: dict[str, str] = {}
+    allocated: dict[int, str] = {}
+    try:
+        for api_server in worker_api_servers or []:
+            entry = dict(api_server)
+            scope = evaluation_api_server_scope(entry)
+            if scope != "worker":
+                raise ValueError(
+                    f"{_evaluation_service_label(entry)!r} is {scope}-scoped and must "
+                    f"not be started per worker; pass only the list returned by "
+                    f"evaluation_worker_api_servers()."
+                )
+            declared_port = entry.get("port")
+            if declared_port is None:
+                raise ValueError(
+                    f"Worker-scoped api_server {_evaluation_service_label(entry)!r} "
+                    f"declares no port; a per-worker service needs one so each worker "
+                    f"slot can be offset from it."
+                )
+            host = str(entry.get("host", "127.0.0.1"))
+            port = int(declared_port) + slot
+            role = f"{_evaluation_service_label(entry)} (worker slot {slot})"
+            clash = allocated.get(port)
+            if clash is not None:
+                raise RuntimeError(
+                    f"Worker slot {slot} maps two services onto {host}:{port}: "
+                    f"{clash} and {role}. Space the declared ports at least "
+                    f"{MAX_EVALUATION_WORKER_SLOTS} apart."
+                )
+            allocated[port] = role
+            url_env_name = _evaluation_service_url_env(entry)
+            if _claim_evaluation_port(
+                host, port, role=role, allow_existing=allow_existing
+            ):
+                cfg = _evaluation_service_launch_config(entry)
+                cfg["port"] = port
+                proc = _start_evaluation_service_proc(cfg, None)
+                procs.append(proc)
+                pending.append((host, port, role, proc))
+                print(f"Evaluation worker service {role} started on {host}:{port}")
+            else:
+                print(
+                    f"Evaluation worker service {role} already served on "
+                    f"{host}:{port}; adopting it"
+                )
+            client_env[url_env_name] = f"http://{host}:{port}"
+        _wait_for_evaluation_services(pending, wait_timeout)
+    except BaseException:
+        _stop_api_servers(procs)
+        raise
+    return procs, client_env
+
+
+@contextlib.contextmanager
+def worker_service_session(
+    worker_api_servers: list[dict],
+    *,
+    worker_slot: int,
+    wait_timeout: float,
+):
+    """Own one worker's services for its lifetime, scoping ``client_env`` to it.
+
+    On exit the previous ``os.environ`` values are restored *before* the
+    services are stopped, so nothing can observe a live endpoint variable that
+    points at an already-terminated server.
+    """
+    server_procs, client_env = start_evaluation_worker_api_servers(
+        worker_api_servers,
+        worker_slot=worker_slot,
+        wait_timeout=wait_timeout,
+    )
+    previous = {key: os.environ.get(key) for key in client_env}
+    os.environ.update(client_env)
+    try:
+        yield client_env
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        _stop_api_servers(server_procs)
 
 
 # ---------------------------------------------------------------------------
