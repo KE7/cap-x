@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import base64
 import io
 import pathlib
@@ -17,7 +18,13 @@ from capx.utils.serve_utils import post_with_retries
 """SAM 3 integration via FastAPI service."""
 
 # Configuration
-SERVICE_URL = "http://127.0.0.1:8114"
+# Honour SAM3_SERVICE_URL, matching capx/integrations/vision/graspnet.py.
+# The LIBERO seed's env_configs declare SAM3 on 8214 (moved off the 811x
+# range so per-worker PyRoki at 8116+slot cannot collide with Molmo on 8122
+# at slot 6), and sets SAM3_SERVICE_URL accordingly -- but this module used
+# to hardcode 8114, so every segment call retried 5x against a dead port and
+# raised. Session-scoped, so resolving at import time is safe.
+SERVICE_URL = os.environ.get("SAM3_SERVICE_URL", "http://127.0.0.1:8114")
 
 
 def _encode_image(image: np.ndarray | Image.Image) -> str:
