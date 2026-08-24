@@ -103,10 +103,39 @@ def _start_api_servers(
 
 
 def _stop_api_servers(server_procs: list) -> None:
-    """Terminate API server sub-processes."""
+    """Terminate API server sub-processes, escalating until they are actually gone.
+
+    A service that outlives this call is not merely leaked memory and a held
+    port.  It also still owns the stdout/stderr it inherited from the
+    evaluator, so a harness that captures evaluator output with
+    ``subprocess.run(..., capture_output=True)`` never observes EOF on those
+    pipes and blocks *forever* -- the evaluator process itself has already
+    exited and been reaped into a zombie, so there is nothing left to time out
+    against.  Observed on sparky: one PyRoki left on 8216 hung `helix evolve`
+    indefinitely at 0% CPU after the evaluation had otherwise finished.
+
+    A plain ``terminate()`` plus a short grace is not sufficient.  These
+    services import JAX/torch and load models at startup, and a process that
+    is still inside that import cannot service SIGTERM promptly; the previous
+    5s grace silently gave up and abandoned it.  Escalate to SIGKILL and
+    verify, because "probably dead" is what caused the hang.
+    """
     for proc in server_procs:
+        if not proc.is_alive():
+            proc.join(timeout=1.0)
+            continue
         proc.terminate()
-        proc.join(timeout=5.0)
+        proc.join(timeout=15.0)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=5.0)
+        if proc.is_alive():
+            print(
+                f"WARNING: api server pid {getattr(proc, 'pid', '?')} survived "
+                f"SIGKILL; it still holds its port and the inherited stdout "
+                f"pipe, which can hang a capturing parent.",
+                file=sys.stderr,
+            )
 
 
 # ---------------------------------------------------------------------------
