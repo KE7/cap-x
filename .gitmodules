@@ -1,6 +1,7 @@
 [submodule "capx/third_party/LIBERO-PRO"]
 	path = capx/third_party/LIBERO-PRO
-	url = https://github.com/uynitsuj/LIBERO-PRO.git
+	url = https://github.com/KE7/LIBERO-PRO.git
+	branch = libero-pro-complete
 [submodule "capx/third_party/verl"]
 	path = capx/third_party/verl
 	url = https://github.com/Max-Fu/verl.git
