@@ -2,6 +2,7 @@ import base64
 import io
 import logging
 from collections.abc import Sequence
+from contextlib import asynccontextmanager
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
@@ -13,11 +14,11 @@ from PIL import Image
 from pydantic import BaseModel
 from transformers import Sam2Model, Sam2Processor, pipeline
 
+from capx.serving.drain_batcher import DrainBatcher
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-app = FastAPI()
 
 # Global state
 _GENERATOR: Any | None = None
@@ -25,6 +26,22 @@ _PROCESSOR: Any | None = None
 _MODEL: Any | None = None
 _POINTS_PER_BATCH: int = 64
 _DEVICE: str = "cuda"
+_BATCHER: DrainBatcher[Any, Any] | None = None
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI):
+    global _BATCHER
+    _BATCHER = DrainBatcher(_run_batch, name="sam2")
+    await _BATCHER.start()
+    try:
+        yield
+    finally:
+        await _BATCHER.close()
+        _BATCHER = None
+
+
+app = FastAPI(lifespan=_lifespan)
 
 # --- Helper Functions (copied from sam2.py) ---
 
@@ -226,123 +243,34 @@ def encode_array(arr: np.ndarray) -> str:
     return base64.b64encode(arr.tobytes()).decode("utf-8")
 
 
-@app.post("/segment", response_model=SegmentResponse)
-async def segment(req: SegmentRequest):
+def _do_segment(req: SegmentRequest):
     if _GENERATOR is None:
         raise HTTPException(status_code=503, detail="Model not initialized")
-
     pil_image = decode_image(req.image_base64)
     height, width = pil_image.size[1], pil_image.size[0]
-
-    if req.box is not None:
-        # Box Prompt Logic
-        if _PROCESSOR is None or _MODEL is None:
-            raise HTTPException(
-                status_code=503, detail="SAM2 processor/model unavailable for box prompt."
-            )
-
-        box = req.box
-        # Format: [[[x_min, y_min, x_max, y_max]]]
-        input_boxes = [[[float(box[0]), float(box[1]), float(box[2]), float(box[3])]]]
-
-        inputs = _PROCESSOR(
-            images=pil_image,
-            input_boxes=input_boxes,
-            return_tensors="pt",
-        ).to(_MODEL.device)
-
-        with torch.no_grad():
-            outputs = _MODEL(**inputs)
-
-        pred_masks = getattr(outputs, "pred_masks", None)
-        if pred_masks is None:
-            pred_masks = outputs.get("pred_masks")
-        if pred_masks is None:
-            raise RuntimeError("SAM2 model did not return pred_masks.")
-
-        try:
-            masks_processed = _PROCESSOR.post_process_masks(
-                pred_masks.cpu(),
-                inputs["original_sizes"],
-                inputs["reshaped_input_sizes"],
-            )[0]
-            parsed_masks = [
-                (masks_processed[i] > 0.0).numpy() for i in range(masks_processed.shape[0])
-            ]
-        except (KeyError, RuntimeError, TypeError):
-            # Fallback interpolation
-            from torch.nn.functional import interpolate
-
-            masks_raw = pred_masks.cpu()
-            if masks_raw.ndim == 5:
-                masks_raw = masks_raw[0, 0]
-
-            if masks_raw.ndim == 3:
-                masks_resized = interpolate(
-                    masks_raw.unsqueeze(0),
-                    size=(height, width),
-                    mode="bilinear",
-                    align_corners=False,
-                )[0]
-            elif masks_raw.ndim == 4:
-                masks_resized = interpolate(
-                    masks_raw, size=(height, width), mode="bilinear", align_corners=False
-                )[0]
-            else:
-                raise ValueError(f"Unexpected mask shape: {masks_raw.shape}")
-
-            parsed_masks = [(masks_resized[i] > 0.0).numpy() for i in range(masks_resized.shape[0])]
-
-        scores_obj = getattr(outputs, "iou_scores", None)
-        if scores_obj is None and isinstance(outputs, dict):
-            scores_obj = outputs.get("iou_scores")
-
-        if scores_obj is not None:
-            scores_raw = scores_obj.cpu().numpy()
-            scores = scores_raw.flatten() if scores_raw.size > 0 else []
-        else:
-            scores = []
-
-        result_masks = []
-        for idx, mask in enumerate(parsed_masks):
-            score_val = float(scores[idx]) if idx < len(scores) else 0.0
-            result_masks.append({"mask": mask, "score": score_val})
-
-        result_masks.sort(key=lambda item: float(item["score"]), reverse=True)
-        if req.max_masks is not None:
-            result_masks = result_masks[: req.max_masks]
-
-    else:
-        # Full Image Segmentation Logic
-        outputs = _GENERATOR(pil_image, points_per_batch=_POINTS_PER_BATCH)
-        parsed = _parse_pipeline_outputs(outputs, req.max_masks)
-
-        result_masks = []
-        for item in parsed:
-            mask_val = item.get("mask")
-            if hasattr(mask_val, "detach"):
-                mask_arr = mask_val.detach().cpu().numpy()
-            else:
-                mask_arr = np.asarray(mask_val, dtype=np.float32)
-
-            mask_arr = _reshape_mask(mask_arr, height, width)
-            result_masks.append(
-                {"mask": mask_arr.astype(bool), "score": float(item.get("score", 0.0))}
-            )
-
-    # Serialize Response
-    response_data = []
-    for item in result_masks:
-        mask_np = item["mask"]
-        response_data.append(
-            MaskData(mask_base64=encode_mask(mask_np), shape=mask_np.shape, score=item["score"])
+    outputs = _GENERATOR(pil_image, points_per_batch=_POINTS_PER_BATCH)
+    parsed = _parse_pipeline_outputs(outputs, req.max_masks)
+    result_masks = []
+    for item in parsed:
+        mask_val = item.get("mask")
+        mask_arr = (
+            mask_val.detach().cpu().numpy()
+            if hasattr(mask_val, "detach")
+            else np.asarray(mask_val, dtype=np.float32)
         )
+        mask_arr = _reshape_mask(mask_arr, height, width)
+        result_masks.append({"mask": mask_arr.astype(bool), "score": float(item.get("score", 0.0))})
+    return SegmentResponse(
+        masks=[
+            MaskData(
+                mask_base64=encode_mask(item["mask"]), shape=item["mask"].shape, score=item["score"]
+            )
+            for item in result_masks
+        ]
+    )
 
-    return SegmentResponse(masks=response_data)
 
-
-@app.post("/segment_point", response_model=PointPromptResponse)
-async def segment_point(req: PointPromptRequest):
+def _do_segment_point(req: PointPromptRequest):
     if _PROCESSOR is None or _MODEL is None:
         raise HTTPException(status_code=503, detail="SAM2 processor/model unavailable")
 
@@ -370,6 +298,126 @@ async def segment_point(req: PointPromptRequest):
         masks_shape=masks_hf.shape,
         masks_dtype=str(masks_hf.dtype),
     )
+
+
+def _serialize_prompt_masks(masks: Any, scores: Any, max_masks: int | None) -> SegmentResponse:
+    masks_np = np.asarray(masks)
+    if masks_np.ndim == 4 and masks_np.shape[0] == 1:
+        masks_np = masks_np[0]
+    score_values = np.asarray(scores).reshape(-1)
+    result_masks = [
+        {
+            "mask": np.asarray(mask).astype(bool),
+            "score": float(score_values[index]) if index < len(score_values) else 0.0,
+        }
+        for index, mask in enumerate(masks_np)
+    ]
+    result_masks.sort(key=lambda item: float(item["score"]), reverse=True)
+    if max_masks is not None:
+        result_masks = result_masks[:max_masks]
+    return SegmentResponse(
+        masks=[
+            MaskData(
+                mask_base64=encode_mask(item["mask"]), shape=item["mask"].shape, score=item["score"]
+            )
+            for item in result_masks
+        ]
+    )
+
+
+def _do_box_prompt_batch(requests: list[SegmentRequest]) -> list[SegmentResponse]:
+    """One SAM2 prompt-mode forward pass for all queued box requests."""
+    assert _PROCESSOR is not None and _MODEL is not None
+    images = [decode_image(req.image_base64) for req in requests]
+    input_boxes = [
+        [[float(req.box[0]), float(req.box[1]), float(req.box[2]), float(req.box[3])]]
+        for req in requests
+    ]
+    inputs = _PROCESSOR(images=images, input_boxes=input_boxes, return_tensors="pt").to(
+        _MODEL.device
+    )
+    with torch.no_grad():
+        outputs = _MODEL(**inputs)
+    pred_masks = getattr(outputs, "pred_masks", None)
+    if pred_masks is None:
+        pred_masks = outputs.get("pred_masks")
+    if pred_masks is None:
+        raise RuntimeError("SAM2 model did not return pred_masks.")
+    masks_by_image = _PROCESSOR.post_process_masks(
+        pred_masks.cpu(), inputs["original_sizes"], inputs["reshaped_input_sizes"]
+    )
+    scores = getattr(outputs, "iou_scores", None)
+    return [
+        _serialize_prompt_masks(
+            masks, scores[index].detach().cpu().numpy() if scores is not None else [], req.max_masks
+        )
+        for index, (masks, req) in enumerate(zip(masks_by_image, requests, strict=True))
+    ]
+
+
+def _do_point_prompt_batch(requests: list[PointPromptRequest]) -> list[PointPromptResponse]:
+    """One SAM2 prompt-mode forward pass for all queued point requests."""
+    assert _PROCESSOR is not None and _MODEL is not None
+    images = [decode_image(req.image_base64) for req in requests]
+    points = [[[[float(req.point_coords[0]), float(req.point_coords[1])]]] for req in requests]
+    inputs = _PROCESSOR(images=images, input_points=points, return_tensors="pt").to(_DEVICE)
+    with torch.no_grad():
+        outputs = _MODEL(**inputs)
+    processed = _PROCESSOR.post_process_masks(outputs.pred_masks, inputs["original_sizes"])
+    responses = []
+    for index, masks in enumerate(processed):
+        masks_np = (
+            masks[0].detach().cpu().numpy() if masks.ndim == 4 else masks.detach().cpu().numpy()
+        )
+        scores_np = outputs.iou_scores[index][0].detach().cpu().numpy()
+        order = np.argsort(scores_np)[::-1]
+        responses.append(
+            PointPromptResponse(
+                scores=scores_np[order].tolist(),
+                masks_base64=encode_array(masks_np[order]),
+                masks_shape=masks_np[order].shape,
+                masks_dtype=str(masks_np.dtype),
+            )
+        )
+    return responses
+
+
+def _run_batch(kind: str, requests: list[Any]) -> list[Any]:
+    if kind == "box":
+        return _do_box_prompt_batch(requests)
+    if kind == "point":
+        return _do_point_prompt_batch(requests)
+    if kind == "full_image":
+        # SAM2's mask-generation pipeline has no multi-image inference API;
+        # it remains serialized by this same persistent model worker.
+        return [_do_segment(request) for request in requests]
+    raise ValueError(f"Unknown SAM2 request kind: {kind}")
+
+
+@app.post("/segment", response_model=SegmentResponse)
+async def segment(req: SegmentRequest):
+    if _GENERATOR is None or _BATCHER is None:
+        raise HTTPException(status_code=503, detail="Model not initialized")
+    try:
+        return await _BATCHER.submit("box" if req.box is not None else "full_image", req)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("SAM2 inference failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
+
+
+@app.post("/segment_point", response_model=PointPromptResponse)
+async def segment_point(req: PointPromptRequest):
+    if _PROCESSOR is None or _MODEL is None or _BATCHER is None:
+        raise HTTPException(status_code=503, detail="SAM2 processor/model unavailable")
+    try:
+        return await _BATCHER.submit("point", req)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("SAM2 point inference failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Inference failed: {exc}") from exc
 
 
 def main(

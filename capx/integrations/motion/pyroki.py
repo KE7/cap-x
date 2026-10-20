@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+import os
+
 import numpy as np
 import requests
 from scipy.spatial.transform import Rotation as SciRotation
@@ -13,7 +15,7 @@ DEFAULT_URL = "http://127.0.0.1:8116"
 
 
 def init_pyroki(
-    server_url: str = DEFAULT_URL,
+    server_url: str | None = None,
 ) -> None:
     """
     A *drop-in replacement* for your original init_pyroki(), but instead of
@@ -21,6 +23,16 @@ def init_pyroki(
 
     Downstream code calling ik_solve_fn() or plan_fn() works identically.
     """
+
+    # Resolve PYROKI_SERVICE_URL at CALL time, not import time. PyRoki is
+    # WORKER-scoped: worker_service_session() starts one server per slot on
+    # declared_port + slot and injects PYROKI_SERVICE_URL into os.environ for
+    # that worker's lifetime -- which happens long after this module is
+    # imported. Reading it at import would capture the unset value and every
+    # solve_ik would hit the dead DEFAULT_URL, which is what made the evolving
+    # agent reimplement IK by hand instead of using this service.
+    if server_url is None:
+        server_url = os.environ.get("PYROKI_SERVICE_URL", DEFAULT_URL)
 
     # Normalize trailing slash
     server_url = server_url.rstrip("/")
