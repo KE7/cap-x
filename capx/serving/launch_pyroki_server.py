@@ -1,5 +1,23 @@
 from __future__ import annotations
 
+import os
+
+# The pyroki IK/plan server only needs capx.integrations.motion.pyroki_snippets,
+# not the heavy franka/libero API registry (robosuite/torch/open3d). Default the
+# isolation flag ON so this server imports cleanly in its dedicated GPU venv
+# (.venv-pyroki) which deliberately omits those deps. setdefault keeps any
+# explicit override from the environment. Must run before importing
+# capx.integrations.* below.
+os.environ.setdefault("CAPX_PYROKI_SERVER_ONLY", "1")
+
+# Disable XLA preallocation BEFORE importing jax (pulled in transitively by
+# `pyroki`). This server shares the unified-memory GB10 GPU with the OmniGibson /
+# Isaac eval (~30 GB) and the other perception servers; preallocating ~75% of VRAM
+# would starve them. With platform allocator + no-prealloc, the IK server's JAX
+# footprint stays ~0.6 GB. setdefault preserves any explicit override.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("XLA_PYTHON_CLIENT_ALLOCATOR", "platform")
+
 import asyncio
 import functools
 import json
@@ -9,8 +27,12 @@ from pathlib import Path
 from typing import Any, List
 
 import numpy as np
+import jax
+import jax.numpy as jnp
 import pyroki as pk  # type: ignore
+import tyro
 import uvicorn
+import yourdfpy
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from scipy.spatial.transform import Rotation, Slerp
@@ -158,10 +180,49 @@ app = FastAPI()
 _ROBOT = None
 _ROBOT_COLL = None
 _TARGET_LINK = None
+# Selected compute device. The pyroki IK/plan server runs on GPU-enabled JAX
+# (jax[cuda13]); JAX binds its platform at import time and selects the GPU from
+# the CUDA_VISIBLE_DEVICES env var that the unified launcher sets per process.
+# This global mirrors the sam3/graspnet servers' `_DEVICE` for parity and is set
+# from the --device CLI flag the launcher emits for GPU-required servers.
+_DEVICE: str = "cuda"
+
+# =====================================================
+# R1Pro (/ik_rest) — custom-URDF rest-cost IK
+# =====================================================
+# The R1Pro BEHAVIOR eval (capx/integrations/r1pro/control.py, the
+# CAPX_PYROKI_REMOTE_IK path) POSTs to /ik_rest with a custom R1Pro URDF and
+# pks.solve_ik_rest (18-DOF dual-arm). This server now serves BOTH the generic
+# panda /ik + /plan AND the R1Pro /ik_rest on the same port so a single GPU
+# pyroki service covers the generic motion clients and the R1Pro eval.
+#
+# The URDF is committed alongside this server (assets/r1pro_ik.urdf). Only the
+# kinematic tree matters for solve_ik_rest, so it is loaded with
+# load_meshes=False — this makes the server self-contained (no dependency on the
+# b1k submodule's mesh tree) while producing identical kinematics to the
+# original asset (verified: 18 actuated joints, identical link names).
+_DEFAULT_R1PRO_URDF = os.environ.get(
+    "CAPX_PYROKI_R1PRO_URDF",
+    str(Path(__file__).parent / "assets" / "r1pro_ik.urdf"),
+)
+
+
+@lru_cache(maxsize=4)
+def _get_r1pro_robot(urdf_path: str) -> pk.Robot:
+    logger.info(f"Loading R1Pro URDF for /ik_rest: {urdf_path}")
+    # Meshes are not needed for kinematic IK; skip them so the server does not
+    # depend on the URDF's relative mesh/ tree.
+    urdf = yourdfpy.URDF.load(urdf_path, load_meshes=False)
+    robot = pk.Robot.from_urdf(urdf)
+    logger.info(
+        f"R1Pro robot loaded: {robot.joints.num_actuated_joints} actuated joints; "
+        f"gripper links present: {[n for n in robot.links.names if 'gripper_link' in n]}"
+    )
+    return robot
 
 
 async def _run_in_thread(fn, *args, **kwargs):
-    """Run a blocking CPU-bound function without blocking the event loop."""
+    """Run a blocking GPU-bound function without blocking the event loop."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
 
@@ -180,6 +241,21 @@ class IkRequest(BaseModel):
 
 class IkResponse(BaseModel):
     joint_positions: list[float]
+
+
+class IkRestRequest(BaseModel):
+    """R1Pro rest-cost IK request (mirrors control.py solve_ik_rest call)."""
+
+    target_link_name: str
+    target_position: list[float]  # (3,)
+    target_wxyz: list[float]  # (4,) wxyz
+    rest_cost_weights: list[float] | None = None
+    initial_q: list[float] | None = None
+    urdf_path: str | None = None
+
+
+class IkRestResponse(BaseModel):
+    cfg: list[float]
 
 
 class ObstacleEntry(BaseModel):
@@ -295,7 +371,7 @@ def init_pyroki_server(
 
 
 def _do_solve_ik(target_pose_wxyz_xyz: np.ndarray, prev_cfg: np.ndarray | None) -> list[float]:
-    """Blocking IK solve (CPU-bound)."""
+    """Blocking IK solve (GPU-bound)."""
     if prev_cfg is None:
         q = pks.solve_ik(
             robot=_ROBOT,
@@ -331,8 +407,50 @@ async def solve_ik(req: IkRequest):
     return IkResponse(joint_positions=joints)
 
 
+def _do_solve_ik_rest(req: IkRestRequest) -> list[float]:
+    """Blocking R1Pro rest-cost IK solve (GPU-bound).
+
+    Mirrors capx/integrations/r1pro/control.py's in-process call
+    `pks.solve_ik_rest(robot, target_link_name, target_position, target_wxyz,
+    rest_cost_weights, initial_q)` so the GPU result is the same algorithm as the
+    CPU path it replaces.
+    """
+    robot = _get_r1pro_robot(req.urdf_path or _DEFAULT_R1PRO_URDF)
+    n = robot.joints.num_actuated_joints
+    target_position = np.asarray(req.target_position, dtype=np.float64).reshape(3)
+    target_wxyz = np.asarray(req.target_wxyz, dtype=np.float64).reshape(4)
+    if req.rest_cost_weights is not None:
+        rest_cost_weights = jnp.asarray(req.rest_cost_weights, dtype=jnp.float32)
+    else:
+        rest_cost_weights = 0.0
+    initial_q = (
+        np.asarray(req.initial_q, dtype=np.float64) if req.initial_q is not None else None
+    )
+    cfg = pks.solve_ik_rest(
+        robot=robot,
+        target_link_name=req.target_link_name,
+        target_position=target_position,
+        target_wxyz=target_wxyz,
+        rest_cost_weights=rest_cost_weights,
+        initial_q=initial_q,
+    )
+    cfg = np.asarray(cfg, dtype=np.float64).reshape(-1)
+    assert cfg.shape == (n,), f"cfg shape {cfg.shape} != ({n},)"
+    return cfg.tolist()
+
+
+@app.post("/ik_rest", response_model=IkRestResponse)
+async def solve_ik_rest(req: IkRestRequest):
+    try:
+        cfg = await _run_in_thread(_do_solve_ik_rest, req)
+    except Exception as e:
+        logger.exception("IK rest solve failed")
+        raise HTTPException(500, f"IK rest solve failed: {e}")
+    return IkRestResponse(cfg=cfg)
+
+
 def _do_plan_motion(req: PlanRequest) -> PlanResponse:
-    """Blocking motion planning (CPU-bound)."""
+    """Blocking motion planning (GPU-bound)."""
     start_pose = np.array(req.start_pose_wxyz_xyz, dtype=np.float64)
     end_pose = np.array(req.end_pose_wxyz_xyz, dtype=np.float64)
 
@@ -373,9 +491,40 @@ async def plan_motion(req: PlanRequest):
         raise HTTPException(500, f"Motion planning failed: {e}")
 
 
+@app.get("/health")
+def health():
+    return {
+        "ok": True,
+        "jax_devices": [str(d) for d in jax.devices()],
+        "robot_loaded": _ROBOT is not None,
+        "r1pro_loaded": _get_r1pro_robot.cache_info().currsize > 0,
+    }
+
+
 # =====================================================
 # ENTRYPOINT
 # =====================================================
+
+
+def _warm_r1pro():
+    """Load the R1Pro robot + JIT-compile solve_ik_rest once at startup so the
+    first /ik_rest call from the eval is fast (control.py uses a 60 s timeout)."""
+    try:
+        robot = _get_r1pro_robot(_DEFAULT_R1PRO_URDF)
+        n = robot.joints.num_actuated_joints
+        logger.info("Warming R1Pro /ik_rest JIT (left + right gripper)...")
+        for link in ("left_gripper_link", "right_gripper_link"):
+            pks.solve_ik_rest(
+                robot=robot,
+                target_link_name=link,
+                target_position=np.array([0.4, 0.2, 0.9]),
+                target_wxyz=np.array([0.0, 0.0, 1.0, 0.0]),
+                rest_cost_weights=jnp.ones(n, dtype=jnp.float32),
+                initial_q=np.zeros(n),
+            )
+        logger.info("R1Pro /ik_rest warm.")
+    except Exception:  # noqa: BLE001
+        logger.exception("R1Pro warm-up failed (will load lazily on first request)")
 
 
 def main(
@@ -383,10 +532,32 @@ def main(
     target_link: str = "panda_hand",
     port: int = 8116,
     host: str = "127.0.0.1",
+    device: str = "cuda",
 ):
+    global _DEVICE
+
+    # Record the requested device. The launcher conveys GPU selection for this
+    # jax[cuda13] server via CUDA_VISIBLE_DEVICES (set per-subprocess) and passes
+    # --device cuda for parity with the other GPU servers; JAX has already bound
+    # the visible GPU at import time, so we surface the choice rather than
+    # re-binding it here.
+    _DEVICE = device
+
+    logger.info(
+        "Starting pyroki server on %s:%d (device=%s, robot=%s, target_link=%s)",
+        host,
+        port,
+        device,
+        robot,
+        target_link,
+    )
+
+    # Generic panda /ik + /plan.
     init_pyroki_server(robot_urdf_name=robot, target_link_name=target_link)
+    # R1Pro /ik_rest (warm so the eval's first solve is within its timeout).
+    _warm_r1pro()
     uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
-    main()
+    tyro.cli(main)
