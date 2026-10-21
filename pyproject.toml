@@ -130,7 +130,8 @@ nvidia-curobo = { path = "capx/third_party/curobo", editable = true}
 
 [tool.uv]
 environments = [
-    "sys_platform == 'linux' and platform_machine == 'x86_64'"
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'"
 ]
 override-dependencies = [
     "transformers<5.0",
@@ -140,7 +141,16 @@ override-dependencies = [
     "opencv-python-headless<4.13",
     "opencv-python ; sys_platform == 'never'",
     "jax<0.4.30",
-    "jaxlib<0.4.30"
+    "jaxlib<0.4.30",
+    # aarch64 / DGX-Spark (GB10, CUDA 13): only open3d 0.18.0 ships an aarch64
+    # linux wheel (cp38-cp311); 0.19+ has none. Pin on aarch64, leave x86_64
+    # untouched. (uv override entries REPLACE the requirement, so x86_64 needs
+    # its own unconstrained entry to preserve the existing resolution.)
+    "open3d==0.18.0 ; platform_machine == 'aarch64'",
+    "open3d ; platform_machine != 'aarch64'",
+    # decord has NO aarch64 wheel at any version (sam3 train/video only). Drop it
+    # on aarch64; keep it on x86_64. Restore via CPU source build if needed.
+    "decord ; platform_machine != 'aarch64'"
 ]
 conflicts = [
   [
